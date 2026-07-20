@@ -1,0 +1,16 @@
+# environment / build artifacts (recreated by setup.bat)
+.venv/
+__pycache__/
+PoE Flipper.exe
+poe-flipper.zip
+
+# runtime state / diagnostics
+flipper.log
+flipper_calib.json
+last_capture.png
+last_ocr.txt
+debug/
+dump_*.png
+
+# local tooling
+.claude/
