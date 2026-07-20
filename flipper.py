@@ -47,8 +47,57 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
-HOTKEY = "alt+q"
+HOTKEY_DEFAULT = "alt+q"
 CALIB_FILE = APP_DIR / "flipper_calib.json"
+CONFIG_FILE = APP_DIR / "flipper_config.json"
+
+
+def load_hotkey():
+    """Read the hotkey from flipper_config.json (created with the default on
+    first run).  Returns (label, modifier_mask, vk)."""
+    import json
+    cfg = {}
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
+    spec = cfg.get("hotkey", HOTKEY_DEFAULT)
+    try:
+        mods, vk = parse_hotkey(spec)
+    except ValueError as e:
+        log(f"invalid hotkey {spec!r} in flipper_config.json ({e}) — "
+            f"falling back to {HOTKEY_DEFAULT}")
+        spec = HOTKEY_DEFAULT
+        mods, vk = parse_hotkey(spec)
+    if "hotkey" not in cfg:
+        try:
+            cfg["hotkey"] = spec
+            CONFIG_FILE.write_text(json.dumps(cfg, indent=2),
+                                   encoding="utf-8")
+        except OSError:
+            pass
+    return spec, mods, vk
+
+
+def parse_hotkey(spec):
+    """'ctrl+shift+x' -> (RegisterHotKey modifier mask, virtual-key code).
+    Supports alt/ctrl/shift/win + a letter, digit, F1-F24 or space."""
+    MODS = {"alt": 0x1, "ctrl": 0x2, "control": 0x2, "shift": 0x4, "win": 0x8}
+    mods, vk = 0, None
+    for part in spec.lower().replace(" ", "").split("+"):
+        if part in MODS:
+            mods |= MODS[part]
+        elif len(part) == 1 and part.isalnum():
+            vk = ord(part.upper())
+        elif re.fullmatch(r"f([1-9]|1[0-9]|2[0-4])", part):
+            vk = 0x6F + int(part[1:])
+        elif part == "space":
+            vk = 0x20
+        else:
+            raise ValueError(f"unknown key {part!r}")
+    if vk is None:
+        raise ValueError("no non-modifier key")
+    return mods, vk
 
 MAX_DENOM = 60          # largest "have"-side of a suggested ratio
 WASTE_WEIGHT = 60.0     # penalty for leftover stock (fraction of N)
@@ -1085,30 +1134,32 @@ class App:
         self.popup = None
         self.busy = False
         self.icon = None
+        self.hotkey, self.hk_mods, self.hk_vk = load_hotkey()
 
     def run(self):
         threading.Thread(target=self._hotkey_listener, daemon=True).start()
         self._start_tray()
         threading.Thread(target=warmup_ocr, daemon=True).start()
-        log(f"flipper running — press {HOTKEY} over the Market Ratio panel")
+        log(f"flipper running — press {self.hotkey} over the Market Ratio "
+            f"panel (rebind in flipper_config.json)")
         self.root.after(50, self._poll)
         self.root.mainloop()
         if self.icon:
             self.icon.stop()
 
     def _hotkey_listener(self):
-        """Native Alt+Q via RegisterHotKey.  Unlike a keyboard hook (the
+        """Native hotkey via RegisterHotKey.  Unlike a keyboard hook (the
         `keyboard` library), this consumes only the exact combo and never
-        delays or re-injects Alt events, so holding Alt in game stays
+        delays or re-injects modifier events, so holding Alt in game stays
         perfectly responsive."""
         from ctypes import wintypes
         u = ctypes.windll.user32
-        MOD_ALT, MOD_NOREPEAT = 0x0001, 0x4000
-        VK_Q = 0x51
+        MOD_NOREPEAT = 0x4000
         WM_HOTKEY = 0x0312
-        if not u.RegisterHotKey(None, 1, MOD_ALT | MOD_NOREPEAT, VK_Q):
-            log("RegisterHotKey Alt+Q failed — another instance is likely "
-                "running; exiting this one")
+        if not u.RegisterHotKey(None, 1, self.hk_mods | MOD_NOREPEAT,
+                                self.hk_vk):
+            log(f"RegisterHotKey {self.hotkey} failed — another instance is "
+                "likely running (or the combo is taken); exiting this one")
             self.q.put(("exit", None))
             return
         msg = wintypes.MSG()
@@ -1124,7 +1175,8 @@ class App:
                     (40, 32), (10, 32)], fill="#c8a24a")
         dr.polygon([(54, 42), (24, 42), (24, 52), (8, 37)], fill="#8a8272")
         menu = pystray.Menu(
-            pystray.MenuItem(f"PoE Flipper ({HOTKEY})", None, enabled=False),
+            pystray.MenuItem(f"PoE Flipper ({self.hotkey})", None,
+                             enabled=False),
             pystray.MenuItem("Exit", self._on_exit),
         )
         self.icon = pystray.Icon("poe-flipper", img, "PoE Flipper", menu)

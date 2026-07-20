@@ -75,6 +75,19 @@ If the flipper.py path ever moves, recompile the launcher:
 If no competing offers exist (dead market), targets fall back to
 market/available ratio +0/15/30% and a warning is shown.
 
+## Rebinding the hotkey
+
+On first run the app writes `flipper_config.json` next to the script. Edit
+it and restart:
+
+```json
+{ "hotkey": "ctrl+shift+x" }
+```
+
+Combos are modifiers (`alt`, `ctrl`, `shift`, `win`) plus one key: a letter,
+digit, `f1`–`f24` or `space`. Invalid combos fall back to `alt+q` (see
+`flipper.log`).
+
 ## Assumptions & tuning
 
 - PoE in (windowed) fullscreen on the primary monitor; any resolution and
