@@ -58,9 +58,13 @@ def load_hotkey():
     import json
     cfg = {}
     try:
-        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        # utf-8-sig: tolerate the BOM that Notepad/PowerShell like to write
+        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except OSError:
         pass
+    except ValueError:
+        log("flipper_config.json is not valid JSON — using defaults "
+            "(file left untouched)")
     spec = cfg.get("hotkey", HOTKEY_DEFAULT)
     try:
         mods, vk = parse_hotkey(spec)
@@ -69,10 +73,9 @@ def load_hotkey():
             f"falling back to {HOTKEY_DEFAULT}")
         spec = HOTKEY_DEFAULT
         mods, vk = parse_hotkey(spec)
-    if "hotkey" not in cfg:
+    if not CONFIG_FILE.exists():
         try:
-            cfg["hotkey"] = spec
-            CONFIG_FILE.write_text(json.dumps(cfg, indent=2),
+            CONFIG_FILE.write_text(json.dumps({"hotkey": spec}, indent=2),
                                    encoding="utf-8")
         except OSError:
             pass

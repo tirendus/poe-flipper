@@ -47,4 +47,4 @@ if (Test-Path $csc) {
 
 Write-Host ""
 Write-Host "Done! Start 'PoE Flipper.exe' (pin it to the taskbar if you like)." -ForegroundColor Green
-Write-Host "In game: PoE at 1920x1080, hover the Market Ratio bar holding Alt, press Alt+Q."
+Write-Host "In game: hover the Market Ratio bar holding Alt, press Alt+Q (any resolution; first capture self-calibrates)."
