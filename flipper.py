@@ -48,7 +48,7 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -380,52 +380,54 @@ def snap_ratio(target, n, lo=None, hi=None, denom_weight=DENOM_WEIGHT,
     return best
 
 
-def build_suggestions(data, n):
-    """Return {'rows': [(label, snap)], 'notes': [...], 'instant': ...}."""
-    out = {"rows": [], "notes": [], "instant": None}
-    avail, comp = data["available"], data["competing"]
-    market = data["market"]
-    best_bid = avail[0]["price"] if avail else None
+def classify_book(levels, frac=0.25):
+    """Split a price-level list (best-priced first, aggregates excluded) into
+    the user's three zones: `top` (best level), `wall` (first level holding
+    at least `frac` of the deepest level's stock — the real competition) and
+    `cluster` (better-priced small-fry levels sitting ahead of the wall).
+    The </> aggregate row is "the abyss" and is never priced against."""
+    real = [e for e in levels if not e.get("approx")]
+    if not real:
+        return None
+    mx = max(e["stock"] for e in real)
+    wall = real[0]
+    if mx > 0:
+        for e in real:
+            if e["stock"] >= frac * mx:
+                wall = e
+                break
+    cluster = [e for e in real if e["price"] < wall["price"]]
+    return {"top": real[0], "wall": wall, "cluster": cluster, "real": real}
 
-    if comp:
-        best_ask = comp[0]["price"]
-        second = comp[1]["price"] if len(comp) > 1 else best_ask * 1.15
-        # two sets: simple ratios (small dividers, coarser prices) and fine
-        # ratios (bigger dividers, prices hug the targets more tightly)
-        sets = [
-            (False, DENOM_WEIGHT, MAX_DENOM, [
-                ("Fast (undercut best)", best_ask * 0.97, None, best_ask),
-                ("Fair (match best)", best_ask, None, None),
-                ("Greedy (above best)",
-                 min((best_ask + second) / 2, best_ask * 1.10), best_ask, None),
-            ]),
-            (True, 0.1, 150, [
-                ("Fast (undercut best)", best_ask * 0.99, None, best_ask),
-                ("Fair (match best)", best_ask, None, None),
-                ("Greedy (above best)", best_ask * 1.03, best_ask, None),
-            ]),
-        ]
-    else:
-        base = market or best_bid
-        if base is None:
-            out["notes"].append("Could not read any prices from the panel.")
-            return out
-        out["notes"].append(
-            "No competing offers parsed — market may be dead. "
-            "Targets based on market/available ratio."
-        )
-        sets = [
-            (False, DENOM_WEIGHT, MAX_DENOM, [
-                ("Fast (near market)", base, None, None),
-                ("Fair (+15%)", base * 1.15, None, None),
-                ("Greedy (+30%)", base * 1.30, None, None),
-            ]),
-        ]
 
-    seen = set()
-    for fine, dweight, dcap, targets in sets:
+def _ratio_text(e):
+    return f"{e['a']:g}:{e['b']:g}"
+
+
+def strategy_rows(levels, n, verb):
+    """Wall-aware order suggestions against a competing book (prices in
+    want-per-have space, lower = more competitive):
+    - '<verb> all'  — smallest clean step past the best level
+    - '<verb> wall' — smallest clean step past the wall
+    - 'Mid cluster' — parked at the average of the small fry above the wall
+    Each in a simple-ratio and a finer-ratio variant, deduped."""
+    cls = classify_book(levels)
+    if cls is None:
+        return [], None
+    top_p = cls["top"]["price"]
+    wall_p = cls["wall"]["price"]
+    targets = [(f"{verb} all", top_p * 0.995, top_p * 0.80, top_p)]
+    if wall_p > top_p:
+        targets.append((f"{verb} wall", wall_p * 0.995, top_p, wall_p))
+        if cls["cluster"]:
+            mid = sum(e["price"] for e in cls["cluster"]) / len(cls["cluster"])
+            targets.append(("Mid cluster", mid, top_p, wall_p))
+    rows, seen = [], set()
+    for fine, dweight, dcap in ((False, DENOM_WEIGHT, MAX_DENOM),
+                                (True, 0.1, 150)):
         for label, t, lo, hi in targets:
-            s = snap_ratio(t, n, lo, hi, denom_weight=dweight, dmax_cap=dcap)
+            s = snap_ratio(t, n, lo=lo, hi=hi, denom_weight=dweight,
+                           dmax_cap=dcap)
             if not s:
                 continue
             key = (s["w"], s["d"], s["used"])
@@ -433,13 +435,57 @@ def build_suggestions(data, n):
                 continue
             seen.add(key)
             s["fine"] = fine
-            out["rows"].append((label, s))
+            rows.append((label, s))
+    return rows, cls
+
+
+def _wall_note(cls):
+    if cls is None or cls["wall"] is cls["top"]:
+        return None
+    fry = sum(e["stock"] for e in cls["cluster"])
+    return (f"wall: {cls['wall']['stock']:,} @ {_ratio_text(cls['wall'])} — "
+            f"small fry ahead of it: {fry:,}")
+
+
+def build_suggestions(data, n):
+    """Return {'rows': [(label, snap)], 'notes': [...], 'instant': ...}."""
+    out = {"rows": [], "notes": [], "instant": None, "dead": False}
+    avail, comp = data["available"], data["competing"]
+    market = data["market"]
+    best_bid = avail[0]["price"] if avail else None
+
+    if comp:
+        out["rows"], cls = strategy_rows(comp, n, "Undercut")
+        note = _wall_note(cls)
+        if note:
+            out["notes"].append(note)
+    else:
+        base = market or best_bid
+        if base is None:
+            out["notes"].append("Could not read any prices from the panel.")
+            return out
+        out["dead"] = True
+        out["notes"].append(
+            "No competing offers parsed — targets based on market/available "
+            "ratio.")
+        seen = set()
+        for label, t in (("Near market", base), ("+15%", base * 1.15),
+                         ("+30%", base * 1.30)):
+            s = snap_ratio(t, n)
+            if s and (s["w"], s["d"]) not in seen:
+                seen.add((s["w"], s["d"]))
+                s["fine"] = False
+                out["rows"].append((label, s))
+
+    if len([e for e in avail if not e.get("approx")]) <= 2 or \
+            len([e for e in comp if not e.get("approx")]) <= 2:
+        out["dead"] = True
 
     if best_bid is not None and out["rows"]:
-        fast_price = out["rows"][0][1]["price"]
-        if fast_price <= best_bid:
+        first_price = out["rows"][0][1]["price"]
+        if first_price <= best_bid:
             out["notes"].append(
-                f"Best instant price ({best_bid:g}) beats the fast listing — "
+                f"Best instant price ({best_bid:g}) beats that listing — "
                 "consider just taking available trades."
             )
 
@@ -471,14 +517,17 @@ def build_buy_suggestions(data, m):
 
     Resale projection: the acquired want-currency would later be sold by
     undercutting the current best AVAILABLE offer (today's sellers) by 1%."""
-    out = {"rows": [], "notes": [], "instant": None, "resale": None}
+    out = {"rows": [], "notes": [], "instant": None, "resale": None,
+           "dead": False}
     avail, comp = data["available"], data["competing"]
     market = data["market"]
     best_bid = avail[0]["price"] if avail else None   # want-per-have
 
-    # sellers currently charge 1/best_bid have per want-unit; undercut by 1%
-    if best_bid:
-        resale = (1 / best_bid) * 0.99
+    # resale: undercut the sellers' WALL (their real depth), not a dud top
+    # row with a handful of stock, by half a percent
+    acls = classify_book(avail) if avail else None
+    if acls:
+        resale = (1 / acls["wall"]["price"]) * 0.995
     elif market:
         resale = 1 / market
     else:
@@ -486,52 +535,34 @@ def build_buy_suggestions(data, m):
     out["resale"] = resale
 
     if comp:
-        best_ask = comp[0]["price"]
-        # paying more have per want = a LOWER want-per-have ratio, so
-        # outbidding rival buyers means going below their ratio
-        sets = [
-            (False, DENOM_WEIGHT, MAX_DENOM, [
-                ("Outbid (queue front)", best_ask * 0.97, None, best_ask),
-                ("Match best bid", best_ask, None, None),
-            ]),
-            (True, 0.1, 150, [
-                ("Outbid (queue front)", best_ask * 0.99, None, best_ask),
-            ]),
-        ]
-        queue = comp[0]["stock"] or "?"
-        out["notes"].append(
-            f"Matching the best bid queues you behind ~{queue} "
-            "already offered at that price."
-        )
+        out["rows"], cls = strategy_rows(comp, m, "Outbid")
+        note = _wall_note(cls)
+        if note:
+            out["notes"].append(note)
     else:
         base = market or best_bid
         if base is None:
             out["notes"].append("Could not read any prices from the panel.")
             return out
+        out["dead"] = True
         out["notes"].append(
             "No competing buyers — bid anchored to market ratio.")
-        sets = [(False, DENOM_WEIGHT, MAX_DENOM,
-                 [("Bid (near market)", base, None, None)])]
+        s = snap_ratio(base, m)
+        if s:
+            s["fine"] = False
+            out["rows"].append(("Bid (near market)", s))
 
-    seen = set()
-    for fine, dweight, dcap, targets in sets:
-        for label, t, lo, hi in targets:
-            s = snap_ratio(t, m, lo=lo, hi=hi,
-                           denom_weight=dweight, dmax_cap=dcap)
-            if not s:
-                continue
-            key = (s["w"], s["d"], s["used"])
-            if key in seen:
-                continue
-            seen.add(key)
-            s["fine"] = fine
-            s["pay_per_unit"] = s["d"] / s["w"]
-            if resale:
-                revenue = s["want_total"] * resale
-                s["resell_revenue"] = int(revenue)
-                s["profit"] = int(revenue - s["used"])
-                s["profit_pct"] = (revenue - s["used"]) / s["used"] * 100
-            out["rows"].append((label, s))
+    if len([e for e in avail if not e.get("approx")]) <= 2 or \
+            len([e for e in comp if not e.get("approx")]) <= 2:
+        out["dead"] = True
+
+    for _label, s in out["rows"]:
+        s["pay_per_unit"] = s["d"] / s["w"]
+        if resale:
+            revenue = s["want_total"] * resale
+            s["resell_revenue"] = int(revenue)
+            s["profit"] = int(revenue - s["used"])
+            s["profit_pct"] = (revenue - s["used"]) / s["used"] * 100
 
     # instant buy: take the available offers with the budget
     if avail:
@@ -1038,13 +1069,20 @@ class Popup:
                                                 sticky="w", padx=(0, 12))
             per = s[per_unit_of] if per_unit_of in s else s["price"]
             info = f"{s['w']}:{s['d']}  ({per:.4g}/ea)"
-            if "profit" in s:
-                info += f"  resell ≈{s['resell_revenue']}" \
-                        f" ({s['profit']:+} | {s['profit_pct']:+.0f}%)"
             tk.Label(grid, text=info, bg=BG, fg="#8a8272",
                      font=("Consolas", 9)).grid(row=row_i, column=3,
                                                 sticky="w", padx=(0, 12))
-            self._fill_btn(grid, s).grid(row=row_i, column=4, pady=1)
+            if "profit" in s:
+                pct = s["profit_pct"]
+                color = ("#7aa86a" if pct >= 15
+                         else "#c05a50" if pct <= 0 else "#8a8272")
+                rs = (f"resell ≈{s['resell_revenue']} "
+                      f"({s['profit']:+} | {pct:+.0f}%)")
+                tk.Label(grid, text=rs, bg=BG, fg=color,
+                         font=("Consolas", 9, "bold" if pct >= 15 else
+                               "normal")).grid(row=row_i, column=4,
+                                               sticky="w", padx=(0, 12))
+            self._fill_btn(grid, s).grid(row=row_i, column=5, pady=1)
             row_i += 1
 
     def _build_result_stage(self, n, sell_sugg, m, buy_sugg):
@@ -1073,6 +1111,14 @@ class Popup:
         if ctx:
             tk.Label(self.frame, text=" | ".join(ctx), bg=BG, fg="#8a8272",
                      font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 4))
+
+        if (sell_sugg and sell_sugg.get("dead")) or \
+                (buy_sugg and buy_sugg.get("dead")):
+            tk.Label(self.frame,
+                     text="⚠ MARKET LOOKS DEAD/THIN — prices may be junk",
+                     bg=BG, fg="#c05a50",
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w",
+                                                        pady=(0, 4))
 
         notes = []
         if sell_sugg:
@@ -1104,7 +1150,7 @@ class Popup:
                     tk.Label(self.frame,
                              text=f"resale estimated at "
                                   f"{buy_sugg['resale']:.4g}/ea "
-                                  f"(1% under current sellers)",
+                                  f"(0.5% under the sellers' wall)",
                              bg=BG, fg="#5a5448",
                              font=("Segoe UI", 8)).pack(anchor="w")
             else:
