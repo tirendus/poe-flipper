@@ -102,11 +102,13 @@ def parse_hotkey(spec):
         raise ValueError("no non-modifier key")
     return mods, vk
 
-MAX_DENOM = 60          # largest "have"-side of a suggested ratio
+MAX_DENOM = 60          # baseline cap for the "have"-side of a ratio
 WASTE_WEIGHT = 60.0     # penalty for leftover stock (fraction of N)
 ERR_WEIGHT = 100.0      # penalty for deviating from target price
-DENOM_WEIGHT = 0.4      # preference for small denominators (0.4 ≈ trade 0.4%
-                        # price accuracy for one step of ratio simplicity)
+DENOM_WEIGHT = 1.5      # preference for simple denominators, normalized by
+                        # the smallest denominator the price can be expressed
+                        # with at all (so 1:1000 for divine-priced items isn't
+                        # punished like 87:4 for chaos-priced ones)
 
 
 def log(msg):
@@ -308,6 +310,25 @@ def parse_tables(tagged_rows):
 
 # ------------------------------------------------------ suggestion math ---
 
+def _denom_penalty(d, dmin, weight):
+    """Simplicity cost of a denominator, relative to the smallest denominator
+    (dmin) that can express the target price at all.  Large denominators get
+    a discount when they are round numbers (1:1050 reads better than 1:1042).
+    """
+    p = weight * d / dmin
+    if d > 20:
+        if d % 100 == 0:
+            mult = 1.0
+        elif d % 50 == 0:
+            mult = 1.15
+        elif d % 10 == 0:
+            mult = 1.3
+        else:
+            mult = 2.0
+        p *= mult
+    return p
+
+
 def snap_ratio(target, n, lo=None, hi=None, denom_weight=DENOM_WEIGHT,
                dmax_cap=MAX_DENOM):
     """Best integer ratio w:d with d dividing a chunk of n, price near target.
@@ -317,7 +338,8 @@ def snap_ratio(target, n, lo=None, hi=None, denom_weight=DENOM_WEIGHT,
     """
     if target <= 0 or n <= 0:
         return None
-    dmax = min(max(dmax_cap, math.ceil(3 / target)), 1000, n)
+    dmin = max(1, math.ceil(1 / target)) if target < 1 else 1
+    dmax = min(max(dmax_cap, math.ceil(3 / target)), 10000, n)
     best = None
     for d in range(1, dmax + 1):
         raw = target * d
@@ -334,7 +356,8 @@ def snap_ratio(target, n, lo=None, hi=None, denom_weight=DENOM_WEIGHT,
                 continue
             rel_err = abs(price - target) / target
             waste = (n - used) / n
-            score = rel_err * ERR_WEIGHT + waste * WASTE_WEIGHT + d * denom_weight
+            score = (rel_err * ERR_WEIGHT + waste * WASTE_WEIGHT
+                     + _denom_penalty(d, dmin, denom_weight))
             if best is None or score < best["score"]:
                 g = math.gcd(w, d)
                 rw, rd = w // g, d // g
@@ -365,7 +388,7 @@ def build_suggestions(data, n):
                 ("Greedy (above best)",
                  min((best_ask + second) / 2, best_ask * 1.10), best_ask, None),
             ]),
-            (True, 0.03, 150, [
+            (True, 0.1, 150, [
                 ("Fast (undercut best)", best_ask * 0.99, None, best_ask),
                 ("Fair (match best)", best_ask, None, None),
                 ("Greedy (above best)", best_ask * 1.03, best_ask, None),
@@ -460,7 +483,7 @@ def build_buy_suggestions(data, m):
                 ("Outbid (queue front)", best_ask * 0.97, None, best_ask),
                 ("Match best bid", best_ask, None, None),
             ]),
-            (True, 0.03, 150, [
+            (True, 0.1, 150, [
                 ("Outbid (queue front)", best_ask * 0.99, None, best_ask),
             ]),
         ]
@@ -932,10 +955,7 @@ class Popup:
             tk.Label(grid, text=info, bg=BG, fg="#8a8272",
                      font=("Consolas", 9)).grid(row=row_i, column=3,
                                                 sticky="w", padx=(0, 12))
-            self._copy_btn(grid, f"⧉ {s['w']}:{s['d']}",
-                           f"{s['w']}:{s['d']}").grid(row=row_i, column=4,
-                                                      padx=(0, 4))
-            self._fill_btn(grid, s).grid(row=row_i, column=5)
+            self._fill_btn(grid, s).grid(row=row_i, column=4, pady=1)
             row_i += 1
 
     def _build_result_stage(self, n, sell_sugg, m, buy_sugg):
@@ -1015,7 +1035,7 @@ class Popup:
                      font=("Segoe UI", 8), wraplength=560,
                      justify="left").pack(anchor="w", pady=(4, 0))
         tk.Label(self.frame,
-                 text="⤷ = click game fields and type amounts | "
+                 text="FILL = click game fields and type amounts | "
                       "Esc or click outside to close",
                  bg=BG, fg="#5a5448", font=("Segoe UI", 7)).pack(
             anchor="e", pady=(8, 0))
@@ -1029,18 +1049,12 @@ class Popup:
             threading.Thread(target=auto_fill,
                              args=(have_amount, want_amount),
                              daemon=True).start()
-        return tk.Button(parent, text="⤷", command=do_fill, bg=BTN_BG,
-                         fg="#7a9a6a", activebackground=ACCENT, relief="flat",
-                         font=("Segoe UI", 9, "bold"), padx=7, cursor="hand2")
+        return tk.Button(parent, text="⤷ FILL", command=do_fill, bg=ACCENT,
+                         fg="#1e1a16", activebackground="#e0be6a",
+                         activeforeground="#1e1a16", relief="flat",
+                         font=("Segoe UI", 9, "bold"), padx=10,
+                         cursor="hand2")
 
-    def _copy_btn(self, parent, text, value):
-        def do_copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(value)
-            self.root.update()
-        return tk.Button(parent, text=text, command=do_copy, bg=BTN_BG,
-                         fg=FG, activebackground=ACCENT, relief="flat",
-                         font=("Segoe UI", 8), padx=6, cursor="hand2")
 
     # -- window management --
 
