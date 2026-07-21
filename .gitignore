@@ -8,6 +8,7 @@ poe-flipper.zip
 flipper.log
 flipper_calib.json
 flipper_config.json
+.updated
 last_capture.png
 last_ocr.txt
 debug/

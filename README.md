@@ -75,6 +75,15 @@ If the flipper.py path ever moves, recompile the launcher:
 If no competing offers exist (dead market), targets fall back to
 market/available ratio +0/15/30% and a warning is shown.
 
+## Auto-update
+
+The app checks the repo's latest GitHub release shortly after startup and
+silently updates itself: downloads the release zip, extracts it over the
+app folder, refreshes venv dependencies / recompiles the launcher if those
+changed, and restarts (waiting until no popup is open). A tray notification
+confirms the new version. Disable with `"auto_update": false` in
+`flipper_config.json`. Config, calibration and logs are never touched.
+
 ## Rebinding the hotkey
 
 On first run the app writes `flipper_config.json` next to the script. Edit

@@ -14,6 +14,7 @@ Usage:
 import argparse
 import ctypes
 import math
+import os
 import queue
 import re
 import sys
@@ -47,24 +48,33 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
+__version__ = "1.0.2"
+GITHUB_REPO = "tirendus/poe-flipper"
+
 HOTKEY_DEFAULT = "alt+q"
 CALIB_FILE = APP_DIR / "flipper_calib.json"
 CONFIG_FILE = APP_DIR / "flipper_config.json"
+UPDATE_MARKER = APP_DIR / ".updated"
+
+
+def load_config():
+    import json
+    try:
+        # utf-8-sig: tolerate the BOM that Notepad/PowerShell like to write
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+    except OSError:
+        return {}
+    except ValueError:
+        log("flipper_config.json is not valid JSON — using defaults "
+            "(file left untouched)")
+        return {}
 
 
 def load_hotkey():
     """Read the hotkey from flipper_config.json (created with the default on
     first run).  Returns (label, modifier_mask, vk)."""
     import json
-    cfg = {}
-    try:
-        # utf-8-sig: tolerate the BOM that Notepad/PowerShell like to write
-        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
-    except OSError:
-        pass
-    except ValueError:
-        log("flipper_config.json is not valid JSON — using defaults "
-            "(file left untouched)")
+    cfg = load_config()
     spec = cfg.get("hotkey", HOTKEY_DEFAULT)
     try:
         mods, vk = parse_hotkey(spec)
@@ -75,8 +85,9 @@ def load_hotkey():
         mods, vk = parse_hotkey(spec)
     if not CONFIG_FILE.exists():
         try:
-            CONFIG_FILE.write_text(json.dumps({"hotkey": spec}, indent=2),
-                                   encoding="utf-8")
+            CONFIG_FILE.write_text(
+                json.dumps({"hotkey": spec, "auto_update": True}, indent=2),
+                encoding="utf-8")
         except OSError:
             pass
     return spec, mods, vk
@@ -767,6 +778,84 @@ def read_panel(tables_img, want_img, have_img):
     return data
 
 
+# --------------------------------------------------------- auto-update ---
+
+def _ver_tuple(v):
+    nums = re.findall(r"\d+", v or "")
+    return tuple(int(x) for x in nums[:3]) if nums else (0,)
+
+
+def check_update(app):
+    """Silently update from the latest GitHub release: download the source
+    zip, extract over the app dir, refresh deps/launcher if they changed,
+    then ask the app to restart itself.  Failures only log."""
+    import io
+    import json
+    import subprocess
+    import urllib.request
+    import zipfile
+    CREATE_NO_WINDOW = 0x08000000
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "poe-flipper"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            rel = json.load(r)
+        tag = rel.get("tag_name", "")
+        if _ver_tuple(tag) <= _ver_tuple(__version__):
+            return
+        asset = next((a for a in rel.get("assets", [])
+                      if a.get("name", "").endswith(".zip")), None)
+        if asset is None:
+            log(f"update {tag} available but has no zip asset — skipping")
+            return
+        log(f"updating {__version__} -> {tag} "
+            f"({asset['name']}, {asset.get('size', 0) // 1024} KB)")
+        with urllib.request.urlopen(asset["browser_download_url"],
+                                    timeout=120) as r:
+            data = r.read()
+
+        def snapshot(name):
+            try:
+                return (APP_DIR / name).read_bytes()
+            except OSError:
+                return b""
+
+        req_before = snapshot("requirements.txt")
+        cs_before = snapshot("launcher.cs")
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            z.extractall(APP_DIR)
+
+        py = APP_DIR / ".venv" / "Scripts" / "python.exe"
+        if snapshot("requirements.txt") != req_before and py.exists():
+            log("requirements changed — updating venv")
+            subprocess.run(
+                [str(py), "-m", "pip", "install", "--quiet",
+                 "--disable-pip-version-check", "-r",
+                 str(APP_DIR / "requirements.txt")],
+                timeout=900, creationflags=CREATE_NO_WINDOW)
+        csc = Path(os.environ.get("WINDIR", r"C:\Windows")) / \
+            "Microsoft.NET" / "Framework64" / "v4.0.30319" / "csc.exe"
+        if snapshot("launcher.cs") != cs_before and csc.exists():
+            log("launcher changed — recompiling")
+            subprocess.run(
+                [str(csc), "/nologo", "/target:winexe",
+                 f"/win32icon:{APP_DIR / 'flipper.ico'}",
+                 f"/out:{APP_DIR / 'PoE Flipper.exe'}",
+                 str(APP_DIR / "launcher.cs")],
+                timeout=120, creationflags=CREATE_NO_WINDOW)
+
+        try:
+            UPDATE_MARKER.write_text(tag, encoding="utf-8")
+        except OSError:
+            pass
+        log(f"updated to {tag} — restarting when idle")
+        app.request_restart(tag)
+    except Exception:
+        log("auto-update failed:\n" + traceback.format_exc())
+
+
 # ------------------------------------------------------------------ UI ---
 
 BG = "#1e1a16"
@@ -1151,18 +1240,50 @@ class App:
         self.popup = None
         self.busy = False
         self.icon = None
+        self._restart = False
         self.hotkey, self.hk_mods, self.hk_vk = load_hotkey()
 
     def run(self):
         threading.Thread(target=self._hotkey_listener, daemon=True).start()
         self._start_tray()
         threading.Thread(target=warmup_ocr, daemon=True).start()
-        log(f"flipper running — press {self.hotkey} over the Market Ratio "
-            f"panel (rebind in flipper_config.json)")
+        threading.Thread(target=self._update_worker, daemon=True).start()
+        self._notify_if_updated()
+        log(f"flipper {__version__} running — press {self.hotkey} over the "
+            f"Market Ratio panel (rebind in flipper_config.json)")
         self.root.after(50, self._poll)
         self.root.mainloop()
         if self.icon:
             self.icon.stop()
+        if self._restart:
+            import subprocess
+            subprocess.Popen([sys.executable, str(APP_DIR / "flipper.py")],
+                             cwd=str(APP_DIR))
+
+    def _update_worker(self):
+        time.sleep(8)   # let startup settle first
+        if load_config().get("auto_update", True):
+            check_update(self)
+
+    def request_restart(self, tag):
+        self.q.put(("restart", tag))
+
+    def _notify_if_updated(self):
+        if not UPDATE_MARKER.exists():
+            return
+        try:
+            tag = UPDATE_MARKER.read_text(encoding="utf-8").strip()
+            UPDATE_MARKER.unlink()
+        except OSError:
+            return
+
+        def notify():
+            time.sleep(3)   # give the tray icon time to appear
+            try:
+                self.icon.notify(f"Updated to {tag}", "PoE Flipper")
+            except Exception:
+                pass
+        threading.Thread(target=notify, daemon=True).start()
 
     def _hotkey_listener(self):
         """Native hotkey via RegisterHotKey.  Unlike a keyboard hook (the
@@ -1173,8 +1294,16 @@ class App:
         u = ctypes.windll.user32
         MOD_NOREPEAT = 0x4000
         WM_HOTKEY = 0x0312
-        if not u.RegisterHotKey(None, 1, self.hk_mods | MOD_NOREPEAT,
+        # retry for a few seconds: after a self-update restart the old
+        # process may still hold the hotkey for a moment
+        registered = False
+        for _ in range(6):
+            if u.RegisterHotKey(None, 1, self.hk_mods | MOD_NOREPEAT,
                                 self.hk_vk):
+                registered = True
+                break
+            time.sleep(1)
+        if not registered:
             log(f"RegisterHotKey {self.hotkey} failed — another instance is "
                 "likely running (or the combo is taken); exiting this one")
             self.q.put(("exit", None))
@@ -1225,18 +1354,32 @@ class App:
         finally:
             self.busy = False
 
+    def _popup_active(self):
+        try:
+            return self.popup is not None and self.popup.win.winfo_exists()
+        except tk.TclError:
+            return False
+
     def _poll(self):
         try:
             while True:
                 kind, payload = self.q.get_nowait()
-                if self.popup:
-                    self.popup.close()
-                    self.popup = None
                 if kind == "show":
+                    if self.popup:
+                        self.popup.close()
                     self.popup = Popup(self.root, payload)
                 elif kind == "exit":
                     self.root.quit()
                     return
+                elif kind == "restart":
+                    if self._popup_active():
+                        # don't yank the app out from under an open popup
+                        self.root.after(
+                            5000, lambda p=payload: self.q.put(("restart", p)))
+                    else:
+                        self._restart = True
+                        self.root.quit()
+                        return
         except queue.Empty:
             pass
         self.root.after(50, self._poll)
