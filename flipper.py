@@ -48,7 +48,7 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -316,6 +316,26 @@ def parse_tables(tagged_rows):
             {"price": price, "a": a, "b": b, "stock": stock,
              "approx": bool(prefix)}
         )
+
+    # sanity filter: an OCR-mangled decimal ("1:1.20" read as "1:120")
+    # produces a price wildly off from its section — drop such outliers
+    for section in ("available", "competing"):
+        levels = data[section]
+        if len(levels) < 3:
+            continue
+        prices = sorted(e["price"] for e in levels)
+        median = prices[len(prices) // 2]
+        kept = []
+        for e in levels:
+            ratio = e["price"] / median if median else 1
+            if ratio > 4 or ratio < 0.25:
+                log(f"dropping implausible {section} level "
+                    f"{_ratio_text(e)} (x{e['stock']}) — "
+                    f"{ratio:.1f}x off the section median")
+                data["unparsed"] += 1
+            else:
+                kept.append(e)
+        data[section] = kept
     return data
 
 
@@ -405,23 +425,29 @@ def _ratio_text(e):
 
 
 def strategy_rows(levels, n, verb):
-    """Wall-aware order suggestions against a competing book (prices in
-    want-per-have space, lower = more competitive):
-    - '<verb> all'  — smallest clean step past the best level
-    - '<verb> wall' — smallest clean step past the wall
-    - 'Mid cluster' — parked at the average of the small fry above the wall
+    """Queue-ladder suggestions against a competing book (prices in
+    want-per-have space, lower = more competitive).  Every level is a wall
+    you can park in front of:
+    - '<verb> all'      — smallest clean step past the best level
+    - '2nd/3rd/4th in line' — step in front of the next level down, queued
+      behind the cumulative stock of the levels above you (better price,
+      slower fill — the flipper picks the tradeoff)
     Each in a simple-ratio and a finer-ratio variant, deduped."""
     cls = classify_book(levels)
     if cls is None:
         return [], None
-    top_p = cls["top"]["price"]
-    wall_p = cls["wall"]["price"]
+    real = cls["real"]
+    top_p = real[0]["price"]
     targets = [(f"{verb} all", top_p * 0.995, top_p * 0.80, top_p)]
-    if wall_p > top_p:
-        targets.append((f"{verb} wall", wall_p * 0.995, top_p, wall_p))
-        if cls["cluster"]:
-            mid = sum(e["price"] for e in cls["cluster"]) / len(cls["cluster"])
-            targets.append(("Mid cluster", mid, top_p, wall_p))
+    ordinal = {1: "2nd", 2: "3rd", 3: "4th"}
+    cum = 0
+    for k in range(1, min(len(real), 4)):
+        cum += real[k - 1]["stock"]
+        lo, hi = real[k - 1]["price"], real[k]["price"]
+        if hi <= lo:
+            continue    # duplicate/OCR-merged level, zero-width band
+        targets.append((f"{ordinal[k]} in line ({cum:,} ahead)",
+                        hi * 0.995, lo, hi))
     rows, seen = [], set()
     for fine, dweight, dcap in ((False, DENOM_WEIGHT, MAX_DENOM),
                                 (True, 0.1, 150)):
@@ -563,6 +589,12 @@ def build_buy_suggestions(data, m):
             s["resell_revenue"] = int(revenue)
             s["profit"] = int(revenue - s["used"])
             s["profit_pct"] = (revenue - s["used"]) / s["used"] * 100
+
+    # a flip that projects at a loss is noise — hide those rows as long as
+    # at least one profitable option exists
+    if any(s.get("profit", 0) > 0 for _l, s in out["rows"]):
+        out["rows"] = [(lb, s) for lb, s in out["rows"]
+                       if s.get("profit", 1) > 0]
 
     # instant buy: take the available offers with the budget
     if avail:
