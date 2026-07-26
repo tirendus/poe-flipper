@@ -48,7 +48,7 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -406,9 +406,19 @@ def classify_book(levels, frac=0.25):
     at least `frac` of the deepest level's stock — the real competition) and
     `cluster` (better-priced small-fry levels sitting ahead of the wall).
     The </> aggregate row is "the abyss" and is never priced against."""
-    real = [e for e in levels if not e.get("approx")]
+    real = []
+    for e in levels:
+        if e.get("approx"):
+            continue
+        # the game sometimes shows the same rounded ratio on several rows —
+        # merge them so ladder bands aren't zero-width and queues add up
+        if real and abs(e["price"] - real[-1]["price"]) < 1e-9:
+            real[-1] = dict(real[-1], stock=real[-1]["stock"] + e["stock"])
+        else:
+            real.append(dict(e))
     if not real:
         return None
+    abyss = next((e for e in levels if e.get("approx")), None)
     mx = max(e["stock"] for e in real)
     wall = real[0]
     if mx > 0:
@@ -417,7 +427,8 @@ def classify_book(levels, frac=0.25):
                 wall = e
                 break
     cluster = [e for e in real if e["price"] < wall["price"]]
-    return {"top": real[0], "wall": wall, "cluster": cluster, "real": real}
+    return {"top": real[0], "wall": wall, "cluster": cluster, "real": real,
+            "abyss": abyss}
 
 
 def _ratio_text(e):
@@ -439,15 +450,20 @@ def strategy_rows(levels, n, verb):
     real = cls["real"]
     top_p = real[0]["price"]
     targets = [(f"{verb} all", top_p * 0.995, top_p * 0.80, top_p)]
-    ordinal = {1: "2nd", 2: "3rd", 3: "4th"}
+    ordinal = {1: "2nd", 2: "3rd", 3: "4th", 4: "5th", 5: "6th"}
     cum = 0
-    for k in range(1, min(len(real), 4)):
+    for k in range(1, min(len(real), 6)):
         cum += real[k - 1]["stock"]
-        lo, hi = real[k - 1]["price"], real[k]["price"]
-        if hi <= lo:
-            continue    # duplicate/OCR-merged level, zero-width band
         targets.append((f"{ordinal[k]} in line ({cum:,} ahead)",
-                        hi * 0.995, lo, hi))
+                        real[k]["price"] * 0.995,
+                        real[k - 1]["price"], real[k]["price"]))
+    # the abyss rung: park just behind the last visible level but in front
+    # of the entire </> aggregate — the deepest spot still worth holding
+    if cls["abyss"] is not None:
+        last_p = real[-1]["price"]
+        cum_all = cum + real[-1]["stock"] if len(real) > 1 else real[0]["stock"]
+        targets.append((f"Front of abyss ({cum_all:,} ahead)",
+                        last_p * 1.005, last_p, last_p * 1.03))
     rows, seen = [], set()
     for fine, dweight, dcap in ((False, DENOM_WEIGHT, MAX_DENOM),
                                 (True, 0.1, 150)):
