@@ -48,7 +48,7 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -114,6 +114,7 @@ def parse_hotkey(spec):
     return mods, vk
 
 MAX_DENOM = 60          # baseline cap for the "have"-side of a ratio
+GREEDY_MIN_PCT = 15.0   # the Greedy buy row prices for at least this margin
 WASTE_WEIGHT = 60.0     # penalty for leftover stock (fraction of N)
 ERR_WEIGHT = 100.0      # penalty for deviating from target price
 DENOM_WEIGHT = 1.5      # preference for simple denominators, normalized by
@@ -597,6 +598,22 @@ def build_buy_suggestions(data, m):
     if len([e for e in avail if not e.get("approx")]) <= 2 or \
             len([e for e in comp if not e.get("approx")]) <= 2:
         out["dead"] = True
+
+    # greedy: the most aggressive price that still nets GREEDY_MIN_PCT
+    # against the resale estimate, wherever that lands in the book
+    if resale and out["rows"]:
+        wph_min = (1 + GREEDY_MIN_PCT / 100) / resale
+        sg = snap_ratio(wph_min * 1.005, m, lo=wph_min * 0.9999,
+                        denom_weight=0.1, dmax_cap=150)
+        if sg:
+            key = (sg["w"], sg["d"], sg["used"])
+            if key not in {(s["w"], s["d"], s["used"])
+                           for _l, s in out["rows"]}:
+                sg["fine"] = False
+                idx = next((i for i, (_l, s) in enumerate(out["rows"])
+                            if s.get("fine")), len(out["rows"]))
+                out["rows"].insert(
+                    idx, (f"Greedy (≥+{GREEDY_MIN_PCT:.0f}%)", sg))
 
     for _label, s in out["rows"]:
         s["pay_per_unit"] = s["d"] / s["w"]
