@@ -47,8 +47,11 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
+TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
+                                     # crop (scaled px) — cells outside are
+                                     # background noise, not table data
 
-__version__ = "1.0.7"
+__version__ = "1.0.8"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -194,7 +197,8 @@ def read_tables(pil_img):
     """OCR the tables crop, return [(section, text), ...] with section in
     {'market', 'available', 'competing'}."""
     global _LAST_CELLS
-    cells = ocr_cells(pil_img)
+    cells = [c for c in ocr_cells(pil_img)
+             if TABLE_X_BAND[0] <= c[1] <= TABLE_X_BAND[1]]
     _LAST_CELLS = cells
     rows = group_rows(cells)
     y_market = y_avail = y_comp = y_end = None
