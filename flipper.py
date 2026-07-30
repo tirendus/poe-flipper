@@ -48,7 +48,7 @@ ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
 
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -436,34 +436,42 @@ def _ratio_text(e):
     return f"{e['a']:g}:{e['b']:g}"
 
 
-def strategy_rows(levels, n, verb):
+def strategy_rows(levels, n, verb, queue_in_want=False):
     """Queue-ladder suggestions against a competing book (prices in
     want-per-have space, lower = more competitive).  Every level is a wall
     you can park in front of:
     - '<verb> all'      — smallest clean step past the best level
     - '2nd/3rd/4th in line' — step in front of the next level down, queued
-      behind the cumulative stock of the levels above you (better price,
-      slower fill — the flipper picks the tradeoff)
-    Each in a simple-ratio and a finer-ratio variant, deduped."""
+      behind the levels above you (better price, slower fill — the flipper
+      picks the tradeoff)
+    Queue-ahead counts are fulfillable trades: when buying, a rival's Stock
+    is the currency they committed, so it converts to items via that
+    level's own price (queue_in_want=True); when selling, Stock already is
+    the item count.  Each rung comes in a simple-ratio and a finer-ratio
+    variant, deduped."""
     cls = classify_book(levels)
     if cls is None:
         return [], None
     real = cls["real"]
+
+    def qty(e):
+        return e["stock"] * e["price"] if queue_in_want else e["stock"]
+
     top_p = real[0]["price"]
     targets = [(f"{verb} all", top_p * 0.995, top_p * 0.80, top_p)]
     ordinal = {1: "2nd", 2: "3rd", 3: "4th", 4: "5th", 5: "6th"}
-    cum = 0
+    cum = 0.0
     for k in range(1, min(len(real), 6)):
-        cum += real[k - 1]["stock"]
-        targets.append((f"{ordinal[k]} in line ({cum:,} ahead)",
+        cum += qty(real[k - 1])
+        targets.append((f"{ordinal[k]} in line ({round(cum):,} ahead)",
                         real[k]["price"] * 0.995,
                         real[k - 1]["price"], real[k]["price"]))
     # the abyss rung: park just behind the last visible level but in front
     # of the entire </> aggregate — the deepest spot still worth holding
     if cls["abyss"] is not None:
         last_p = real[-1]["price"]
-        cum_all = cum + real[-1]["stock"] if len(real) > 1 else real[0]["stock"]
-        targets.append((f"Front of abyss ({cum_all:,} ahead)",
+        cum_all = cum + qty(real[-1]) if len(real) > 1 else qty(real[0])
+        targets.append((f"Front of abyss ({round(cum_all):,} ahead)",
                         last_p * 1.005, last_p, last_p * 1.03))
     rows, seen = [], set()
     for fine, dweight, dcap in ((False, DENOM_WEIGHT, MAX_DENOM),
@@ -578,7 +586,8 @@ def build_buy_suggestions(data, m):
     out["resale"] = resale
 
     if comp:
-        out["rows"], cls = strategy_rows(comp, m, "Outbid")
+        out["rows"], cls = strategy_rows(comp, m, "Outbid",
+                                         queue_in_want=True)
         note = _wall_note(cls)
         if note:
             out["notes"].append(note)
