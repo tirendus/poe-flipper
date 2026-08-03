@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.9"
+__version__ = "1.0.10"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -876,11 +876,36 @@ def build_buy_qty_suggestions(data, n):
         return best_h
 
     seen_h = set()
+    fine_rows = []
 
-    def add(label, h):
+    def add(label, h, fine=False):
         if h is not None and h >= 1 and h not in seen_h:
             seen_h.add(h)
-            out["rows"].append((label, qty_row(h)))
+            r = qty_row(h)
+            r["fine"] = fine
+            (fine_rows if fine else out["rows"]).append((label, r))
+
+    def clean_u(lo, hi):
+        """Smallest integer per-unit price strictly inside the band — a
+        1:u order fills one item at a time, which matters when the item
+        is scarce (a 10:293 block needs ten items' worth of fills)."""
+        if hi is None:
+            return None
+        u = math.floor(1 / hi) + 1
+        if lo is not None and u >= 1 / lo:
+            return None
+        return u
+
+    def add_rung(label, t, lo, hi):
+        u = clean_u(lo, hi)
+        if u is not None:
+            add(label, n * u)
+        h = find_h(t, lo, hi)
+        # the exact-total variant is finer-priced but fills in coarser
+        # blocks — secondary when a clean 1:u exists
+        if h is not None and (u is None or h != n * u):
+            add(label, h, fine=u is not None)
+        return u is not None or h is not None
 
     cls = classify_book(comp) if comp else None
     if cls is not None:
@@ -893,18 +918,16 @@ def build_buy_qty_suggestions(data, n):
         if note:
             out["notes"].append(note)
         top_p = real[0]["price"]
-        add("Outbid all", find_h(top_p * 0.995, top_p * 0.80, top_p))
+        add_rung("Outbid all", top_p * 0.995, top_p * 0.80, top_p)
         ordinal = {1: "2nd", 2: "3rd", 3: "4th", 4: "5th", 5: "6th"}
         cum = 0.0
         for k in range(1, min(len(real), 6)):
             cum += items(real[k - 1])
-            h = find_h(real[k]["price"] * 0.995,
-                       real[k - 1]["price"], real[k]["price"])
-            if h is not None:
-                add(f"{ordinal[k]} in line ({round(cum):,} ahead)", h)
-            else:
-                # no integer price fits between adjacent levels (tiny n on
-                # a densely packed book) — join the upper level's queue
+            if not add_rung(f"{ordinal[k]} in line ({round(cum):,} ahead)",
+                            real[k]["price"] * 0.995,
+                            real[k - 1]["price"], real[k]["price"]):
+                # no price fits between adjacent levels (tiny n on a
+                # densely packed book) — join the upper level's queue
                 add(f"Match {_ratio_text(real[k - 1])} "
                     f"({round(cum):,} ahead)",
                     round(n / real[k - 1]["price"]))
@@ -912,8 +935,8 @@ def build_buy_qty_suggestions(data, n):
             last_p = real[-1]["price"]
             cum_all = cum + items(real[-1]) if len(real) > 1 \
                 else items(real[0])
-            add(f"Front of abyss ({round(cum_all):,} ahead)",
-                find_h(last_p * 1.005, last_p, last_p * 1.03))
+            add_rung(f"Front of abyss ({round(cum_all):,} ahead)",
+                     last_p * 1.005, last_p, last_p * 1.05)
     else:
         base = market or None
         if base is None:
@@ -926,13 +949,7 @@ def build_buy_qty_suggestions(data, n):
         seen_h.add(h)
         out["rows"].append(("Bid (near market)", qty_row(h)))
 
-    # greedy: cheapest currency total that still nets the minimum margin
-    if resale:
-        h_g = int(n * resale / (1 + GREEDY_MIN_PCT / 100))
-        if h_g >= 1 and h_g not in seen_h:
-            seen_h.add(h_g)
-            out["rows"].append(
-                (f"Greedy (≥+{GREEDY_MIN_PCT:.0f}%)", qty_row(h_g)))
+    out["rows"] += fine_rows
 
     if len([e for e in avail if not e.get("approx")]) <= 2 or \
             len([e for e in comp if not e.get("approx")]) <= 2:
