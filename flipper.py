@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.10"
+__version__ = "1.0.11"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -885,27 +885,42 @@ def build_buy_qty_suggestions(data, n):
             r["fine"] = fine
             (fine_rows if fine else out["rows"]).append((label, r))
 
-    def clean_u(lo, hi):
-        """Smallest integer per-unit price strictly inside the band — a
-        1:u order fills one item at a time, which matters when the item
-        is scarce (a 10:293 block needs ten items' worth of fills)."""
+    # fill-block sizes to try, smallest first: an order fills in chunks of
+    # its reduced ratio's want side, so small blocks matter for scarce
+    # items; capping at n//4 guarantees at least four separate fills
+    divisors = [d for d in range(1, max(1, n // 4) + 1) if n % d == 0]
+
+    def block_price(lo, hi):
+        """Currency total whose price sits strictly inside the wph band,
+        balancing fill-block size against price premium over the level
+        being outbid: 1:u beats 2:x beats 4:x unless the smaller block
+        overpays too much on a wide band.  Returns h or None."""
         if hi is None:
             return None
-        u = math.floor(1 / hi) + 1
-        if lo is not None and u >= 1 / lo:
-            return None
-        return u
+        lo_u = 1 / hi                        # per-unit bounds, exclusive
+        hi_u = (1 / lo) if lo is not None else None
+        best = None                          # (score, h)
+        for w in divisors:
+            m = math.floor(lo_u * w) + 1     # smallest m with m/w > lo_u
+            u = m / w
+            if m < 1 or (hi_u is not None and u >= hi_u):
+                continue
+            premium_pct = (u / lo_u - 1) * 100
+            score = premium_pct + w * 0.5
+            if best is None or score < best[0]:
+                best = (score, n * m // w)
+        return best[1] if best else None
 
     def add_rung(label, t, lo, hi):
-        u = clean_u(lo, hi)
-        if u is not None:
-            add(label, n * u)
+        hb = block_price(lo, hi)
+        if hb is not None:
+            add(label, hb)
         h = find_h(t, lo, hi)
-        # the exact-total variant is finer-priced but fills in coarser
-        # blocks — secondary when a clean 1:u exists
-        if h is not None and (u is None or h != n * u):
-            add(label, h, fine=u is not None)
-        return u is not None or h is not None
+        # the exact-total variant is finer-priced but fills in one giant
+        # block — secondary when a small-block price exists
+        if h is not None and h != hb:
+            add(label, h, fine=hb is not None)
+        return hb is not None or h is not None
 
     cls = classify_book(comp) if comp else None
     if cls is not None:
