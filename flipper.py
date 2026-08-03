@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -193,6 +193,143 @@ def group_rows(cells, pitch=ROW_PITCH):
     return out
 
 
+X_SPLIT = 232   # scaled px: ratio column is left of this, stock column right
+
+
+def _repair_ratio_token(tok, stock_txt, above, below, market_big, one_first):
+    """Reconstruct a wrapped/overprinted long ratio.
+
+    The game wraps ratios with a long side ('1 : 178.50') onto a second
+    line inside the row slot and sometimes overprints the short side onto
+    the number, producing tokens like '178.50' (clean wrap), '173:80'
+    (mash of '1 :' and 178.80) or '1715:50' (mash for 176.50).  The
+    decimal tail survives the overlap, and trusted neighbours / the market
+    ratio pin down the integer part.  one_first: section format is
+    '1 : big' (True) or 'big : 1' (False)."""
+    prefix = "<" if "<" in tok else (">" if ">" in tok else "")
+    core = re.sub(r"[<>‹›\s]", "", tok)
+    anchor = above if above is not None else (
+        below if below is not None else market_big)
+    if anchor is None or anchor < 10:
+        return None
+    v = None
+    if re.fullmatch(r"\d+(?:\.\d+)?", core):
+        v = float(core)                       # clean wrapped number
+    else:
+        m = re.search(r"[:.](\d{1,2})$", core)
+        if not m:
+            return None
+        tail = m.group(1)                     # decimals survive the overlap
+        best = None
+        for base in (int(anchor), int(anchor) - 1, int(anchor) + 1):
+            c = float(f"{base}.{tail}")
+            if abs(c - anchor) / anchor <= 0.02 and \
+                    (best is None or abs(c - anchor) < abs(best - anchor)):
+                best = c
+        v = best
+    if v is None or not 0.9 <= v / anchor <= 1.1:
+        return None
+    ratio = f"1 : {v:g}" if one_first else f"{v:g} : 1"
+    return f"{prefix}{ratio} {stock_txt}".strip()
+
+
+def _assemble_zone(cells, y0, y1, market_form, market_big):
+    """Rebuild one table section from raw cells by pairing each stock cell
+    with its ratio cell — same line, or the wrapped line ~half a row
+    below — then repairing broken ratio tokens."""
+    zone = [c for c in cells if y0 < c[2] < y1]
+    ratios, stocks = [], []
+    for c in zone:
+        low = c[0].lower()
+        if not any(ch.isdigit() for ch in c[0]) or \
+                "ratio" in low or "stock" in low or "trades" in low:
+            continue
+        (ratios if c[1] < X_SPLIT else stocks).append(c)
+
+    pairs, used = [], set()
+    for st in sorted(stocks, key=lambda c: c[2]):
+        best_i, best_dy = None, None
+        for i, rt in enumerate(ratios):
+            if i in used:
+                continue
+            dy = rt[2] - st[2]
+            if -16 <= dy <= 30 and (best_dy is None or abs(dy) < abs(best_dy)):
+                best_i, best_dy = i, dy
+        if best_i is None:
+            pairs.append((None, st))
+        else:
+            used.add(best_i)
+            pairs.append((ratios[best_i], st))
+    for i, rt in enumerate(ratios):     # full rows OCR'd as a single cell
+        if i not in used and RATIO_ROW.match(rt[0]):
+            pairs.append((rt, None))
+    pairs.sort(key=lambda p: (p[1] if p[1] is not None else p[0])[2])
+
+    # first pass: the game always anchors one ratio side at 1, so a parsed
+    # row in '1 : x' or 'x : 1' form is trusted; anything else (mash of
+    # overprinted glyphs, or an unparsable fragment) is a repair candidate
+    texts, bigs, forms = [], [], []
+    for rt, st in pairs:
+        stock_txt = st[0] if st is not None else ""
+        if rt is None:
+            texts.append(f"?ratio? {stock_txt}")
+            bigs.append(None)
+            forms.append(None)
+            continue
+        raw = f"{rt[0]} {stock_txt}".strip()
+        m = RATIO_ROW.match(raw)
+        conforming = False
+        if m:
+            try:
+                a = parse_ratio_num(m.group(2))
+                b = parse_ratio_num(m.group(3))
+                conforming = (a == 1 or b == 1)
+            except ValueError:
+                pass
+        if conforming:
+            texts.append(raw)
+            bigs.append(b if a == 1 else a)
+            forms.append(a == 1)
+        else:
+            texts.append(("?", rt[0], stock_txt))
+            bigs.append(None)
+            forms.append(None)
+
+    # section display form: from trusted rows, else the market ratio
+    form_votes = [f for f in forms if f is not None]
+    if form_votes:
+        one_first = sum(form_votes) >= len(form_votes) / 2
+    elif market_form is not None:
+        one_first = market_form
+    else:
+        one_first = None
+
+    # second pass: repair broken tokens using neighbouring trusted rows
+    out = []
+    for i, t in enumerate(texts):
+        if isinstance(t, tuple):
+            fixed = None
+            if one_first is not None:
+                above = next((bigs[j] for j in range(i - 1, -1, -1)
+                              if bigs[j] is not None), None)
+                below = next((bigs[j] for j in range(i + 1, len(bigs))
+                              if bigs[j] is not None), None)
+                fixed = _repair_ratio_token(t[1], t[2], above, below,
+                                            market_big, one_first)
+            if fixed:
+                m = RATIO_ROW.match(fixed)
+                if m:
+                    bigs[i] = parse_ratio_num(
+                        m.group(3) if one_first else m.group(2))
+                out.append(fixed)
+                log(f"repaired wrapped ratio {t[1]!r} -> {fixed!r}")
+            else:
+                out.append(f"{t[1]} {t[2]}".strip())
+        else:
+            out.append(t)
+    return out
+
+
 def read_tables(pil_img):
     """OCR the tables crop, return [(section, text), ...] with section in
     {'market', 'available', 'competing'}."""
@@ -225,19 +362,40 @@ def read_tables(pil_img):
     if y_comp is None and len(header_rows) >= 2:
         y_comp = header_rows[1]
         log("'Competing Trades' header not read — using sub-header position")
+
+    y_stop = y_end if y_end is not None else 1e9
     tagged = []
+    market_form = market_big = None
     for cy, text in rows:
-        if y_end is not None and cy >= y_end:
-            continue
-        if y_comp is not None and cy > y_comp:
-            section = "competing"
-        elif y_avail is not None and cy > y_avail:
-            section = "available"
-        elif y_market is not None and cy > y_market:
-            section = "market"
-        else:
-            continue
-        tagged.append((section, text))
+        if y_market is not None and y_avail is not None and \
+                y_market < cy < y_avail:
+            tagged.append(("market", text))
+            m = RATIO_ROW.match(text)
+            if m and market_big is None:
+                try:
+                    a = parse_ratio_num(m.group(2))
+                    b = parse_ratio_num(m.group(3))
+                    if a == 1:
+                        market_form, market_big = True, b
+                    elif b == 1:
+                        market_form, market_big = False, a
+                except ValueError:
+                    pass
+    if y_avail is None and y_comp is None:
+        # no structure found — fall back to plain row tagging
+        for cy, text in rows:
+            if y_market is not None and cy > y_market and cy < y_stop:
+                tagged.append(("market", text))
+        return tagged
+    if y_avail is not None:
+        avail_end = y_comp if y_comp is not None else y_stop
+        for text in _assemble_zone(cells, y_avail, min(avail_end, y_stop),
+                                   market_form, market_big):
+            tagged.append(("available", text))
+    if y_comp is not None:
+        for text in _assemble_zone(cells, y_comp, y_stop,
+                                   market_form, market_big):
+            tagged.append(("competing", text))
     return tagged
 
 
@@ -341,6 +499,18 @@ def parse_tables(tagged_rows):
             else:
                 kept.append(e)
         data[section] = kept
+
+    # the </> aggregate is always the LAST row of a section: markers that
+    # bleed onto other rows (overlapping wrapped text) are noise, and a
+    # final row repeating the previous price is the aggregate even when
+    # its marker was lost
+    for section in ("available", "competing"):
+        levels = data[section]
+        for e in levels[:-1]:
+            e["approx"] = False
+        if len(levels) >= 2 and not levels[-1]["approx"] and \
+                abs(levels[-1]["price"] - levels[-2]["price"]) < 1e-9:
+            levels[-1]["approx"] = True
     return data
 
 
@@ -440,8 +610,8 @@ def _ratio_text(e):
     return f"{e['a']:g}:{e['b']:g}"
 
 
-def strategy_rows(levels, n, verb, queue_in_want=False):
-    """Queue-ladder suggestions against a competing book (prices in
+def _ladder_targets(levels, verb, queue_in_want=False):
+    """Build the queue-ladder targets against a competing book (prices in
     want-per-have space, lower = more competitive).  Every level is a wall
     you can park in front of:
     - '<verb> all'      — smallest clean step past the best level
@@ -451,8 +621,7 @@ def strategy_rows(levels, n, verb, queue_in_want=False):
     Queue-ahead counts are fulfillable trades: when buying, a rival's Stock
     is the currency they committed, so it converts to items via that
     level's own price (queue_in_want=True); when selling, Stock already is
-    the item count.  Each rung comes in a simple-ratio and a finer-ratio
-    variant, deduped."""
+    the item count."""
     cls = classify_book(levels)
     if cls is None:
         return [], None
@@ -477,6 +646,15 @@ def strategy_rows(levels, n, verb, queue_in_want=False):
         cum_all = cum + qty(real[-1]) if len(real) > 1 else qty(real[0])
         targets.append((f"Front of abyss ({round(cum_all):,} ahead)",
                         last_p * 1.005, last_p, last_p * 1.03))
+    return targets, cls
+
+
+def strategy_rows(levels, n, verb, queue_in_want=False):
+    """Ladder targets snapped to divisible ratios for quantity `n`, each in
+    a simple-ratio and a finer-ratio variant, deduped."""
+    targets, cls = _ladder_targets(levels, verb, queue_in_want)
+    if cls is None:
+        return [], None
     rows, seen = [], set()
     for fine, dweight, dcap in ((False, DENOM_WEIGHT, MAX_DENOM),
                                 (True, 0.1, 150)):
@@ -656,6 +834,129 @@ def build_buy_suggestions(data, m):
                 break
         if got >= 1:
             out["instant"] = (int(got), int(round(m - max(0.0, remaining))))
+    return out
+
+
+def build_buy_qty_suggestions(data, n):
+    """Buy an exact quantity `n` of the I-Want item: same queue ladder as
+    the flip view, but the want side is locked to n and only the have
+    (currency) total varies — so prices step in 1/n increments."""
+    out = {"rows": [], "notes": [], "instant": None, "resale": None,
+           "dead": False}
+    avail, comp = data["available"], data["competing"]
+    market = data["market"]
+
+    acls = classify_book(avail) if avail else None
+    if acls:
+        resale = (1 / acls["wall"]["price"]) * 0.995
+    elif market:
+        resale = 1 / market
+    else:
+        resale = None
+    out["resale"] = resale
+
+    def qty_row(h):
+        g = math.gcd(n, h)
+        return {"w": n // g, "d": h // g, "price": n / h, "used": h,
+                "left": 0, "want_total": n, "fine": False}
+
+    def find_h(t, lo, hi):
+        """Integer currency total whose price n/h sits strictly inside the
+        band, closest to the target."""
+        best_h = None
+        h0 = max(1, int(n / t))
+        for h in range(max(1, h0 - 2), h0 + 4):
+            p = n / h
+            if lo is not None and p <= lo:
+                continue
+            if hi is not None and p >= hi:
+                continue
+            if best_h is None or abs(p - t) < abs(n / best_h - t):
+                best_h = h
+        return best_h
+
+    seen_h = set()
+
+    def add(label, h):
+        if h is not None and h >= 1 and h not in seen_h:
+            seen_h.add(h)
+            out["rows"].append((label, qty_row(h)))
+
+    cls = classify_book(comp) if comp else None
+    if cls is not None:
+        real = cls["real"]
+
+        def items(e):
+            return e["stock"] * e["price"]
+
+        note = _wall_note(cls)
+        if note:
+            out["notes"].append(note)
+        top_p = real[0]["price"]
+        add("Outbid all", find_h(top_p * 0.995, top_p * 0.80, top_p))
+        ordinal = {1: "2nd", 2: "3rd", 3: "4th", 4: "5th", 5: "6th"}
+        cum = 0.0
+        for k in range(1, min(len(real), 6)):
+            cum += items(real[k - 1])
+            h = find_h(real[k]["price"] * 0.995,
+                       real[k - 1]["price"], real[k]["price"])
+            if h is not None:
+                add(f"{ordinal[k]} in line ({round(cum):,} ahead)", h)
+            else:
+                # no integer price fits between adjacent levels (tiny n on
+                # a densely packed book) — join the upper level's queue
+                add(f"Match {_ratio_text(real[k - 1])} "
+                    f"({round(cum):,} ahead)",
+                    round(n / real[k - 1]["price"]))
+        if cls["abyss"] is not None:
+            last_p = real[-1]["price"]
+            cum_all = cum + items(real[-1]) if len(real) > 1 \
+                else items(real[0])
+            add(f"Front of abyss ({round(cum_all):,} ahead)",
+                find_h(last_p * 1.005, last_p, last_p * 1.03))
+    else:
+        base = market or None
+        if base is None:
+            out["notes"].append("Could not read any prices from the panel.")
+            return out
+        out["dead"] = True
+        out["notes"].append(
+            "No competing buyers — bid anchored to market ratio.")
+        h = max(1, round(n / base))
+        seen_h.add(h)
+        out["rows"].append(("Bid (near market)", qty_row(h)))
+
+    # greedy: cheapest currency total that still nets the minimum margin
+    if resale:
+        h_g = int(n * resale / (1 + GREEDY_MIN_PCT / 100))
+        if h_g >= 1 and h_g not in seen_h:
+            seen_h.add(h_g)
+            out["rows"].append(
+                (f"Greedy (≥+{GREEDY_MIN_PCT:.0f}%)", qty_row(h_g)))
+
+    if len([e for e in avail if not e.get("approx")]) <= 2 or \
+            len([e for e in comp if not e.get("approx")]) <= 2:
+        out["dead"] = True
+
+    # plain buying, not flipping — no resale projection on the rows
+    for _label, s in out["rows"]:
+        s["pay_per_unit"] = s["used"] / s["want_total"]
+
+    # instant: cost of taking n items straight from the available offers
+    if avail:
+        remaining = float(n)
+        cost = 0.0
+        for e in avail:
+            if e["price"] <= 0:
+                continue
+            take = min(remaining, e["stock"])
+            cost += take / e["price"]
+            remaining -= take
+            if remaining <= 0:
+                break
+        got = n - max(0, math.ceil(remaining))
+        if got >= 1:
+            out["instant"] = (int(got), int(round(cost)))
     return out
 
 
@@ -1024,6 +1325,8 @@ class Popup:
         self.entry_sell = make_entry("Sell — how many (I Have)?")
         self.entry_buy = make_entry(
             "Flip budget — I Have to spend buying I Want (optional)")
+        self.entry_qty = make_entry(
+            "Buy — how many I Want (optional)")
         self.entry = self.entry_sell  # first focus target
         self.entry_sell.focus_set()
 
@@ -1098,9 +1401,10 @@ class Popup:
     def _on_submit(self, _event):
         n = self._parse_qty(self.entry_sell)
         m = self._parse_qty(self.entry_buy)
-        if n is None and m is None:
-            self.entry_sell.configure(bg="#4a2b25")
-            self.entry_buy.configure(bg="#4a2b25")
+        q = self._parse_qty(self.entry_qty)
+        if n is None and m is None and q is None:
+            for e in (self.entry_sell, self.entry_buy, self.entry_qty):
+                e.configure(bg="#4a2b25")
             return
         if self.ref.get("error"):
             return
@@ -1111,10 +1415,11 @@ class Popup:
         data = self.ref["data"]
         sell_sugg = build_suggestions(data, n) if n else None
         buy_sugg = build_buy_suggestions(data, m) if m else None
+        qty_sugg = build_buy_qty_suggestions(data, q) if q else None
         for child in self.frame.winfo_children():
             child.destroy()
         del self.status
-        self._build_result_stage(n, sell_sugg, m, buy_sugg)
+        self._build_result_stage(n, sell_sugg, m, buy_sugg, q, qty_sugg)
         self._place()
         self._force_focus()
 
@@ -1163,7 +1468,8 @@ class Popup:
             self._fill_btn(grid, s).grid(row=row_i, column=5, pady=1)
             row_i += 1
 
-    def _build_result_stage(self, n, sell_sugg, m, buy_sugg):
+    def _build_result_stage(self, n, sell_sugg, m, buy_sugg, q=None,
+                            qty_sugg=None):
         d = self.ref["data"]
         have = d.get("have_name", "I Have")
         want = d.get("want_name", "I Want")
@@ -1172,6 +1478,8 @@ class Popup:
             parts.append(f"sell {n} {have}")
         if m:
             parts.append(f"buy {want} with {m} {have}")
+        if q:
+            parts.append(f"buy {q} {want}")
         title = " / ".join(parts)
         title = title[0].upper() + title[1:]
         tk.Label(self.frame, text=title, bg=BG,
@@ -1191,7 +1499,8 @@ class Popup:
                      font=("Segoe UI", 8)).pack(anchor="w", pady=(0, 4))
 
         if (sell_sugg and sell_sugg.get("dead")) or \
-                (buy_sugg and buy_sugg.get("dead")):
+                (buy_sugg and buy_sugg.get("dead")) or \
+                (qty_sugg and qty_sugg.get("dead")):
             tk.Label(self.frame,
                      text="⚠ MARKET LOOKS DEAD/THIN — prices may be junk",
                      bg=BG, fg="#c05a50",
@@ -1243,6 +1552,24 @@ class Popup:
                     anchor="w", pady=(2, 0))
             notes += buy_sugg["notes"]
 
+        if qty_sugg:
+            tk.Label(self.frame, text=f"BUY {q} {want}", bg=BG, fg="#b0a890",
+                     font=("Segoe UI", 9, "bold")).pack(anchor="w",
+                                                        pady=(8, 0))
+            if qty_sugg["rows"]:
+                self._render_rows(qty_sugg["rows"], "pay_per_unit")
+            else:
+                tk.Label(self.frame, text="No usable suggestion.",
+                         bg=BG, fg="#d06050",
+                         font=("Segoe UI", 9)).pack(anchor="w")
+            if qty_sugg["instant"]:
+                got, spent = qty_sugg["instant"]
+                tk.Label(self.frame,
+                         text=f"Instant: buy ~{got} right now for ~{spent}",
+                         bg=BG, fg="#7a9a6a", font=("Segoe UI", 9)).pack(
+                    anchor="w", pady=(2, 0))
+            notes += [x for x in qty_sugg["notes"] if x not in notes]
+
         for note in notes:
             tk.Label(self.frame, text="⚠ " + note, bg=BG, fg="#d0a050",
                      font=("Segoe UI", 8), wraplength=560,
@@ -1274,9 +1601,11 @@ class Popup:
     def _place(self):
         self.win.update_idletasks()
         w = self.win.winfo_reqwidth()
+        h = self.win.winfo_reqheight()
         sw = self.win.winfo_screenwidth()
         sh = self.win.winfo_screenheight()
-        self.win.geometry(f"+{(sw - w) // 2}+{int(sh * 0.30)}")
+        y = min(int(sh * 0.30), max(10, sh - h - 30))
+        self.win.geometry(f"+{(sw - w) // 2}+{y}")
 
     def _force_focus(self):
         try:

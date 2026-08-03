@@ -50,7 +50,10 @@ If the flipper.py path ever moves, recompile the launcher:
    The input popup appears instantly while OCR runs in the background.
 3. Type your sell quantity, and/or Tab to the second field and enter a flip
    budget (in the I-Have currency) to plan buying the I-Want item for
-   resale. Press Enter.
+   resale, and/or Tab to the third field and enter an exact quantity of the
+   I-Want item to buy (queue-ladder prices for that amount; where a book is
+   too densely packed for an in-between price, it offers matching a level's
+   queue instead). Press Enter.
 4. You get up to three suggestions:
    - **Fast** — undercuts the best competing offer (~3%), fills quickest.
    - **Fair** — matches the best competing price.
