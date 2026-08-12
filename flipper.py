@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.11"
+__version__ = "1.0.12"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -631,22 +631,40 @@ def _ladder_targets(levels, verb, queue_in_want=False):
         return e["stock"] * e["price"] if queue_in_want else e["stock"]
 
     top_p = real[0]["price"]
-    targets = [(f"{verb} all", top_p * 0.995, top_p * 0.80, top_p)]
+    targets = [(f"{verb} all", top_p * 0.995, top_p * 0.80, top_p, real[0])]
     ordinal = {1: "2nd", 2: "3rd", 3: "4th", 4: "5th", 5: "6th"}
     cum = 0.0
     for k in range(1, min(len(real), 6)):
         cum += qty(real[k - 1])
         targets.append((f"{ordinal[k]} in line ({round(cum):,} ahead)",
                         real[k]["price"] * 0.995,
-                        real[k - 1]["price"], real[k]["price"]))
+                        real[k - 1]["price"], real[k]["price"], real[k]))
     # the abyss rung: park just behind the last visible level but in front
     # of the entire </> aggregate — the deepest spot still worth holding
     if cls["abyss"] is not None:
         last_p = real[-1]["price"]
         cum_all = cum + qty(real[-1]) if len(real) > 1 else qty(real[0])
         targets.append((f"Front of abyss ({round(cum_all):,} ahead)",
-                        last_p * 1.005, last_p, last_p * 1.03))
+                        last_p * 1.005, last_p, last_p * 1.03, None))
     return targets, cls
+
+
+def _forced_step(lvl, n, lo, hi):
+    """For a level displayed as '1 : integer' the natural beat is exactly
+    one currency unit past it (1:411 over 1:410) — no snapping heuristics.
+    Decimal-priced levels return None and keep the generic logic."""
+    if lvl is None or lvl.get("a") != 1:
+        return None
+    b = lvl["b"]
+    if b < 10 or not float(b).is_integer():
+        return None
+    d = int(b) + 1
+    price = 1 / d
+    if n < d or (lo is not None and price <= lo) or price >= hi:
+        return None
+    used = (n // d) * d
+    return {"w": 1, "d": d, "price": price, "used": used,
+            "left": n - used, "want_total": used // d}
 
 
 def strategy_rows(levels, n, verb, queue_in_want=False):
@@ -658,9 +676,15 @@ def strategy_rows(levels, n, verb, queue_in_want=False):
     rows, seen = [], set()
     for fine, dweight, dcap in ((False, DENOM_WEIGHT, MAX_DENOM),
                                 (True, 0.1, 150)):
-        for label, t, lo, hi in targets:
-            s = snap_ratio(t, n, lo=lo, hi=hi, denom_weight=dweight,
-                           dmax_cap=dcap)
+        for label, t, lo, hi, lvl in targets:
+            if not fine:
+                s = _forced_step(lvl, n, lo, hi)
+                if s is None:
+                    s = snap_ratio(t, n, lo=lo, hi=hi, denom_weight=dweight,
+                                   dmax_cap=dcap)
+            else:
+                s = snap_ratio(t, n, lo=lo, hi=hi, denom_weight=dweight,
+                               dmax_cap=dcap)
             if not s:
                 continue
             key = (s["w"], s["d"], s["used"])
