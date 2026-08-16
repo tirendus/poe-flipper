@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.12"
+__version__ = "1.0.13"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -649,6 +649,49 @@ def _ladder_targets(levels, verb, queue_in_want=False):
     return targets, cls
 
 
+def simplest_between(lo, hi):
+    """Simplest fraction (w, d) with lo < w/d < hi, via the Stern-Brocot /
+    continued-fraction walk.  Guarantees a hit for any non-empty band, with
+    the smallest denominator that can express a price inside it."""
+    if not 0 < lo < hi:
+        return None
+
+    def rec(lo, hi):
+        fl = math.floor(lo)
+        if fl + 1 < hi:
+            return (fl + 1, 1)
+        lo_f = lo - fl
+        hi_f = hi - fl
+        if lo_f <= 0:
+            k = math.floor(1 / hi_f) + 1
+            return (fl * k + 1, k)
+        a, b = rec(1 / hi_f, 1 / lo_f)
+        return (fl * a + b, a)
+
+    # shave the bounds so float noise can't produce a tie with a level
+    w, d = rec(lo * (1 + 1e-9), hi * (1 - 1e-9))
+    return (w, d)
+
+
+def _simplest_row(n, lo, hi):
+    """Coarse ladder row from the simplest fraction near the band's
+    aggressive edge (within 3% of the level being beaten)."""
+    if hi is None:
+        return None
+    band_lo = max(lo, hi * 0.97) if lo is not None else hi * 0.97
+    fr = simplest_between(band_lo, hi)
+    if fr is None:
+        return None
+    w, d = fr
+    if d > min(2000, n):
+        return None
+    used = (n // d) * d
+    if used <= 0:
+        return None
+    return {"w": w, "d": d, "price": w / d, "used": used,
+            "left": n - used, "want_total": w * (used // d)}
+
+
 def _forced_step(lvl, n, lo, hi):
     """For a level displayed as '1 : integer' the natural beat is exactly
     one currency unit past it (1:411 over 1:410) — no snapping heuristics.
@@ -679,6 +722,8 @@ def strategy_rows(levels, n, verb, queue_in_want=False):
         for label, t, lo, hi, lvl in targets:
             if not fine:
                 s = _forced_step(lvl, n, lo, hi)
+                if s is None:
+                    s = _simplest_row(n, lo, hi)
                 if s is None:
                     s = snap_ratio(t, n, lo=lo, hi=hi, denom_weight=dweight,
                                    dmax_cap=dcap)
