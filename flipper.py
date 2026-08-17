@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.13"
+__version__ = "1.0.14"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -693,21 +693,25 @@ def _simplest_row(n, lo, hi):
 
 
 def _forced_step(lvl, n, lo, hi):
-    """For a level displayed as '1 : integer' the natural beat is exactly
-    one currency unit past it (1:411 over 1:410) — no snapping heuristics.
+    """For a level displayed with an integer long side the natural beat is
+    exactly one currency unit past it: 1:411 over 1:410 when buying,
+    324:1 under 325:1 when selling — no snapping heuristics.
     Decimal-priced levels return None and keep the generic logic."""
-    if lvl is None or lvl.get("a") != 1:
+    if lvl is None:
         return None
-    b = lvl["b"]
-    if b < 10 or not float(b).is_integer():
+    a, b = lvl.get("a"), lvl.get("b")
+    if a == 1 and b >= 10 and float(b).is_integer():
+        w, d = 1, int(b) + 1          # pay one more per item
+    elif b == 1 and a >= 10 and float(a).is_integer():
+        w, d = int(a) - 1, 1          # ask one less per item
+    else:
         return None
-    d = int(b) + 1
-    price = 1 / d
+    price = w / d
     if n < d or (lo is not None and price <= lo) or price >= hi:
         return None
     used = (n // d) * d
-    return {"w": 1, "d": d, "price": price, "used": used,
-            "left": n - used, "want_total": used // d}
+    return {"w": w, "d": d, "price": price, "used": used,
+            "left": n - used, "want_total": w * (used // d)}
 
 
 def strategy_rows(levels, n, verb, queue_in_want=False):
