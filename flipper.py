@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.14"
+__version__ = "1.0.15"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -714,6 +714,71 @@ def _forced_step(lvl, n, lo, hi):
             "left": n - used, "want_total": w * (used // d)}
 
 
+def _step_above(lvl, n, lo, hi):
+    """Minimal one-unit step on the NON-CROSSING side of a level: ask just
+    over the standing buyers / bid just under the standing sellers.
+    Integer-priced levels only; mirrors _forced_step's direction."""
+    if lvl is None:
+        return None
+    a, b = lvl.get("a"), lvl.get("b")
+    if a == 1 and b >= 10 and float(b).is_integer():
+        w, d = 1, int(b) - 1
+    elif b == 1 and a >= 10 and float(a).is_integer():
+        w, d = int(a) + 1, 1
+    else:
+        return None
+    price = w / d
+    if n < d or price <= lo or (hi is not None and price >= hi):
+        return None
+    used = (n // d) * d
+    return {"w": w, "d": d, "price": price, "used": used,
+            "left": n - used, "want_total": w * (used // d)}
+
+
+def _dead_market_rows(avail, market, n):
+    """No competing orders: price strictly past the standing available
+    offers (never AT them — that just executes instantly), with patience
+    tiers.  Returns (rows, note) or (None, None) if nothing to anchor on."""
+    cls = classify_book(avail) if avail else None
+    if cls is not None:
+        lvl = cls["wall"]
+        anchor = lvl["price"]
+        note = ("no competing orders — pricing just past the standing "
+                f"offers (wall {lvl['stock']:,} @ {_ratio_text(lvl)})")
+    elif market:
+        lvl, anchor = None, market
+        note = "no competing orders — pricing anchored to the market ratio"
+    else:
+        return None, None
+    rows, seen = [], set()
+    targets = [("Step past offers", anchor * 1.005, anchor, anchor * 1.03),
+               ("Patient (+10%)", anchor * 1.10, anchor, None),
+               ("Very patient (+25%)", anchor * 1.25, anchor, None)]
+    for i, (label, t, lo, hi) in enumerate(targets):
+        s = None
+        if i == 0:
+            s = _step_above(lvl, n, lo, hi)
+            if s is None:
+                fr = simplest_between(lo, anchor * 1.03)
+                if fr is not None:
+                    w, d = fr
+                    if d <= min(2000, n) and n // d > 0:
+                        used = (n // d) * d
+                        s = {"w": w, "d": d, "price": w / d, "used": used,
+                             "left": n - used, "want_total": w * (used // d)}
+        if s is None:
+            s = snap_ratio(t, n, lo=lo, hi=hi)
+        if not s:
+            continue
+        key = (s["w"], s["d"], s["used"])
+        if key in seen:
+            continue
+        seen.add(key)
+        s["fine"] = False
+        rows.append((label, s))
+    return rows, note
+
+
 def strategy_rows(levels, n, verb, queue_in_want=False):
     """Ladder targets snapped to divisible ratios for quantity `n`, each in
     a simple-ratio and a finer-ratio variant, deduped."""
@@ -766,22 +831,13 @@ def build_suggestions(data, n):
         if note:
             out["notes"].append(note)
     else:
-        base = market or best_bid
-        if base is None:
+        rows, note = _dead_market_rows(avail, market, n)
+        if rows is None:
             out["notes"].append("Could not read any prices from the panel.")
             return out
         out["dead"] = True
-        out["notes"].append(
-            "No competing offers parsed — targets based on market/available "
-            "ratio.")
-        seen = set()
-        for label, t in (("Near market", base), ("+15%", base * 1.15),
-                         ("+30%", base * 1.30)):
-            s = snap_ratio(t, n)
-            if s and (s["w"], s["d"]) not in seen:
-                seen.add((s["w"], s["d"]))
-                s["fine"] = False
-                out["rows"].append((label, s))
+        out["notes"].append(note)
+        out["rows"] = rows
 
     if len([e for e in avail if not e.get("approx")]) <= 2 or \
             len([e for e in comp if not e.get("approx")]) <= 2:
@@ -847,17 +903,13 @@ def build_buy_suggestions(data, m):
         if note:
             out["notes"].append(note)
     else:
-        base = market or best_bid
-        if base is None:
+        rows, note = _dead_market_rows(avail, market, m)
+        if rows is None:
             out["notes"].append("Could not read any prices from the panel.")
             return out
         out["dead"] = True
-        out["notes"].append(
-            "No competing buyers — bid anchored to market ratio.")
-        s = snap_ratio(base, m)
-        if s:
-            s["fine"] = False
-            out["rows"].append(("Bid (near market)", s))
+        out["notes"].append(note)
+        out["rows"] = rows
 
     if len([e for e in avail if not e.get("approx")]) <= 2 or \
             len([e for e in comp if not e.get("approx")]) <= 2:
@@ -1026,16 +1078,21 @@ def build_buy_qty_suggestions(data, n):
             add_rung(f"Front of abyss ({round(cum_all):,} ahead)",
                      last_p * 1.005, last_p, last_p * 1.05)
     else:
-        base = market or None
-        if base is None:
+        acls = classify_book(avail) if avail else None
+        anchor = acls["wall"]["price"] if acls else market
+        if not anchor:
             out["notes"].append("Could not read any prices from the panel.")
             return out
         out["dead"] = True
         out["notes"].append(
-            "No competing buyers — bid anchored to market ratio.")
-        h = max(1, round(n / base))
-        seen_h.add(h)
-        out["rows"].append(("Bid (near market)", qty_row(h)))
+            "No competing buyers — bidding just under the standing sellers.")
+        # largest currency total whose price stays strictly non-crossing
+        h = int(n / anchor)
+        while h >= 1 and n / h <= anchor:
+            h -= 1
+        if h >= 1:
+            seen_h.add(h)
+            out["rows"].append(("Step past offers", qty_row(h)))
 
     out["rows"] += fine_rows
 
@@ -1397,6 +1454,8 @@ class Popup:
         self.win.bind("<Escape>", lambda e: self.close())
         self.win.bind("<FocusOut>", self._on_focus_out)
         self._had_focus = False
+        self._focus_target = None
+        self._first_fill = None
         self.win.bind("<FocusIn>", self._on_focus_in)
         self._build_input_stage()
         self._place()
@@ -1433,6 +1492,7 @@ class Popup:
         self.entry_qty = make_entry(
             "Buy — how many I Want (optional)")
         self.entry = self.entry_sell  # first focus target
+        self._focus_target = self.entry_sell
         self.entry_sell.focus_set()
 
     _NUMPAD_NAV = {"KP_Insert": "0", "KP_End": "1", "KP_Down": "2",
@@ -1524,7 +1584,12 @@ class Popup:
         for child in self.frame.winfo_children():
             child.destroy()
         del self.status
+        self._first_fill = None
         self._build_result_stage(n, sell_sugg, m, buy_sugg, q, qty_sugg)
+        # Enter fires the focused FILL button (the first row by default)
+        self._focus_target = self._first_fill
+        if self._first_fill is not None:
+            self._first_fill.focus_set()
         self._place()
         self._force_focus()
 
@@ -1570,7 +1635,10 @@ class Popup:
                          font=("Consolas", 9, "bold" if pct >= 15 else
                                "normal")).grid(row=row_i, column=4,
                                                sticky="w", padx=(0, 12))
-            self._fill_btn(grid, s).grid(row=row_i, column=5, pady=1)
+            btn = self._fill_btn(grid, s)
+            btn.grid(row=row_i, column=5, pady=1)
+            if self._first_fill is None:
+                self._first_fill = btn
             row_i += 1
 
     def _build_result_stage(self, n, sell_sugg, m, buy_sugg, q=None,
@@ -1685,7 +1753,19 @@ class Popup:
                  bg=BG, fg="#5a5448", font=("Segoe UI", 7)).pack(
             anchor="e", pady=(8, 0))
         for seq in ("<Return>", "<KP_Enter>", "<Alt-Return>", "<Alt-KP_Enter>"):
-            self.win.bind(seq, lambda e: self.close())
+            self.win.bind(seq, self._results_return)
+
+    def _results_return(self, _event=None):
+        focused = None
+        try:
+            focused = self.win.focus_get()
+        except (tk.TclError, KeyError):
+            pass
+        if isinstance(focused, tk.Button):
+            focused.invoke()
+        else:
+            self.close()
+        return "break"
 
     def _fill_btn(self, parent, s):
         def do_fill():
@@ -1698,7 +1778,8 @@ class Popup:
                          fg="#1e1a16", activebackground="#e0be6a",
                          activeforeground="#1e1a16", relief="flat",
                          font=("Segoe UI", 9, "bold"), padx=10,
-                         cursor="hand2")
+                         cursor="hand2", highlightthickness=2,
+                         highlightbackground=BG, highlightcolor="#f5f0e0")
 
 
     # -- window management --
@@ -1752,8 +1833,9 @@ class Popup:
         try:
             self.win.lift()
             self.win.focus_force()
-            if hasattr(self, "entry") and self.entry.winfo_exists():
-                self.entry.focus_set()
+            if self._focus_target is not None and \
+                    self._focus_target.winfo_exists():
+                self._focus_target.focus_set()
         except tk.TclError:
             pass
         self._focus_attempts += 1
