@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.16"
+__version__ = "1.0.17"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
