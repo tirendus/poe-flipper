@@ -89,7 +89,9 @@ def load_hotkey():
     if not CONFIG_FILE.exists():
         try:
             CONFIG_FILE.write_text(
-                json.dumps({"hotkey": spec, "auto_update": True}, indent=2),
+                json.dumps({"hotkey": spec, "auto_update": True,
+                            "wall_fraction": 0.25, "greedy_min_pct": 15,
+                            "fill_verify": True}, indent=2),
                 encoding="utf-8")
         except OSError:
             pass
@@ -118,6 +120,26 @@ def parse_hotkey(spec):
 
 MAX_DENOM = 60          # baseline cap for the "have"-side of a ratio
 GREEDY_MIN_PCT = 15.0   # the Greedy buy row prices for at least this margin
+                        # (override: "greedy_min_pct" in flipper_config.json)
+WALL_FRACTION = 0.25    # a level is "the wall" when it holds at least this
+                        # share of the deepest level's stock
+                        # (override: "wall_fraction" in flipper_config.json)
+FILL_VERIFY = True      # re-OCR the game fields after auto-fill and warn on
+                        # mismatch ("fill_verify" in flipper_config.json)
+DEBUG_KEEP = 30         # newest suspicious captures kept in debug/
+
+
+def apply_config():
+    """Apply optional tuning overrides from flipper_config.json."""
+    global GREEDY_MIN_PCT, WALL_FRACTION, FILL_VERIFY
+    cfg = load_config()
+    try:
+        GREEDY_MIN_PCT = float(cfg.get("greedy_min_pct", GREEDY_MIN_PCT))
+        WALL_FRACTION = min(1.0, max(0.01, float(
+            cfg.get("wall_fraction", WALL_FRACTION))))
+        FILL_VERIFY = bool(cfg.get("fill_verify", FILL_VERIFY))
+    except (TypeError, ValueError):
+        log("invalid tuning values in flipper_config.json — using defaults")
 WASTE_WEIGHT = 60.0     # penalty for leftover stock (fraction of N)
 ERR_WEIGHT = 100.0      # penalty for deviating from target price
 DENOM_WEIGHT = 1.5      # preference for simple denominators, normalized by
@@ -575,7 +597,7 @@ def snap_ratio(target, n, lo=None, hi=None, denom_weight=DENOM_WEIGHT,
     return best
 
 
-def classify_book(levels, frac=0.25):
+def classify_book(levels, frac=None):
     """Split a price-level list (best-priced first, aggregates excluded) into
     the user's three zones: `top` (best level), `wall` (first level holding
     at least `frac` of the deepest level's stock — the real competition) and
@@ -598,7 +620,8 @@ def classify_book(levels, frac=0.25):
     wall = real[0]
     if mx > 0:
         for e in real:
-            if e["stock"] >= frac * mx:
+            if e["stock"] >= (frac if frac is not None
+                              else WALL_FRACTION) * mx:
                 wall = e
                 break
     cluster = [e for e in real if e["price"] < wall["price"]]
@@ -1162,6 +1185,38 @@ def auto_fill(have_amount, want_amount):
     time.sleep(0.25)        # let the popup close and the game take focus
     fill(geo.pt(HAVE_FIELD_POS), have_amount)
     fill(geo.pt(WANT_FIELD_POS), want_amount)
+    if FILL_VERIFY:
+        time.sleep(0.35)    # let the game render the typed values
+        _verify_fill(geo, have_amount, want_amount)
+
+
+def _read_field(full_img, geo, ref_pos):
+    """OCR one in-game amount field; returns int or None."""
+    x, y = geo.pt(ref_pos)
+    crop = full_img.crop((max(0, x - 46), max(0, y - 16), x + 46, y + 16))
+    digits = re.sub(r"\D", "", "".join(
+        c[0] for c in sorted(ocr_cells(crop, scale=4), key=lambda c: c[1])))
+    return int(digits) if digits else None
+
+
+def _verify_fill(geo, have_amount, want_amount):
+    """Re-capture the amount fields after typing; warn if the game shows
+    different numbers (lost focus mid-sequence, moved panel, missed key)."""
+    try:
+        full = capture_full()
+        got_have = _read_field(full, geo, HAVE_FIELD_POS)
+        got_want = _read_field(full, geo, WANT_FIELD_POS)
+        if got_have == have_amount and got_want == want_amount:
+            return
+        msg = (f"FILL CHECK FAILED — game shows "
+               f"{got_have if got_have is not None else '?'} / "
+               f"{got_want if got_want is not None else '?'} but expected "
+               f"{have_amount} / {want_amount}. Check before placing!")
+        log(msg)
+        if _APP is not None:
+            _APP.q.put(("toast", msg))
+    except Exception:
+        log("fill verification failed:\n" + traceback.format_exc())
 
 
 # ------------------------------------------------- geometry / capture ---
@@ -1187,6 +1242,7 @@ class Geometry:
 
 
 _GEO = None     # geometry of the last capture, used by auto_fill
+_APP = None     # running App instance, for worker threads to post UI events
 
 
 def load_geometry(w, h):
@@ -1341,6 +1397,9 @@ def read_panel(tables_img, want_img, have_img):
                 f"(avail={len(data['available'])}, "
                 f"comp={len(data['competing'])}, "
                 f"unparsed={data['unparsed']})")
+            for old in sorted(dbg.glob("*.png"))[:-DEBUG_KEEP]:
+                old.unlink()
+                old.with_suffix(".txt").unlink(missing_ok=True)
         except OSError:
             pass
     try:
@@ -1882,6 +1941,8 @@ class App:
         self.icon = None
         self._restart = False
         self.hotkey, self.hk_mods, self.hk_vk = load_hotkey()
+        global _APP
+        _APP = self
 
     def run(self):
         threading.Thread(target=self._hotkey_listener, daemon=True).start()
@@ -1994,6 +2055,22 @@ class App:
         finally:
             self.busy = False
 
+    def _show_toast(self, msg):
+        """Small self-closing warning that never takes keyboard focus."""
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=BG, highlightthickness=2,
+                      highlightbackground="#c05a50")
+        tk.Label(win, text=msg, bg=BG, fg="#e8b0a8", padx=16, pady=10,
+                 font=("Segoe UI", 10, "bold"), wraplength=480,
+                 justify="left").pack()
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        win.geometry(f"+{(sw - win.winfo_reqwidth()) // 2}+80")
+        win.bind("<Button-1>", lambda e: win.destroy())
+        win.after(6000, win.destroy)
+
     def _popup_active(self):
         try:
             return self.popup is not None and self.popup.win.winfo_exists()
@@ -2008,6 +2085,8 @@ class App:
                     if self.popup:
                         self.popup.close()
                     self.popup = Popup(self.root, payload)
+                elif kind == "toast":
+                    self._show_toast(payload)
                 elif kind == "exit":
                     self.root.quit()
                     return
@@ -2111,6 +2190,7 @@ def main():
         except (OSError, AttributeError):
             pass
 
+    apply_config()
     ap = argparse.ArgumentParser()
     ap.add_argument("--test", metavar="IMAGE",
                     help="run OCR + parsing on a saved 1920x1080 screenshot")

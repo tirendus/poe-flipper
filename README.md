@@ -68,11 +68,14 @@ If the flipper.py path ever moves, recompile the launcher:
    resell 1% under the current sellers (Available Trades). Set up the panel
    with I Want = the item you're flipping and I Have = what you pay; no
    swapping needed.
-6. Each row has a ⧉ button (copies the ratio, e.g. `22:1`) and a ⤷ button
-   that auto-fills the game: it clicks the I Have amount field, clears it,
-   types the amount, then does the same for I Want. Click positions come
-   from the calibrated geometry automatically; `python flipper.py --pos`
-   shows the computed points and live cursor position for sanity checks.
+6. Each row has a ⤷ FILL button that auto-fills the game: it clicks the
+   I Have amount field, clears it, types the amount, then does the same for
+   I Want — afterwards it re-reads both fields via OCR and flashes a red
+   warning if the game shows different numbers (disable with
+   `"fill_verify": false`). The first row's FILL is focused, so
+   Alt+Q → quantity → Enter → Enter is the whole flow; Tab moves between
+   rows. Click positions come from the calibrated geometry automatically;
+   `python flipper.py --pos` shows the computed points for sanity checks.
 7. Esc, Enter, or clicking outside closes the popup.
 
 If no competing offers exist (dead market), targets fall back to
@@ -99,6 +102,35 @@ it and restart:
 Combos are modifiers (`alt`, `ctrl`, `shift`, `win`) plus one key: a letter,
 digit, `f1`–`f24` or `space`. Invalid combos fall back to `alt+q` (see
 `flipper.log`).
+
+The same file holds tuning knobs (all optional): `wall_fraction` (share of
+the deepest level's stock that makes a level "the wall", default 0.25),
+`greedy_min_pct` (margin floor for the Greedy flip row, default 15),
+`fill_verify` (re-OCR the game fields after auto-fill, default true),
+`auto_update` (default true).
+
+## Development
+
+Run the regression suite before any change lands:
+
+```bash
+.venv\Scripts\python.exe -m unittest discover -s tests
+```
+
+`tests/test_math.py` replays every pricing/parsing bug ever fixed against
+its original order book; `tests/test_ocr.py` runs the full OCR pipeline on
+synthetic screenshots (any resolution) and real captured fixtures.
+
+Releases go through `release.py`, which refuses to publish unless the tree
+is clean and the suite passes, then bumps the version, tags, builds the zip
+from tracked files, publishes, and verifies the shipped zip:
+
+```bash
+.venv\Scripts\python.exe release.py 1.0.17 --notes "What changed."
+```
+
+Auto-update clients install whatever gets released, so never bypass the
+gate.
 
 ## Assumptions & tuning
 
