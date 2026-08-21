@@ -51,7 +51,7 @@ TABLE_X_BAND = (45, 395)             # parchment content span inside the tables
                                      # crop (scaled px) — cells outside are
                                      # background noise, not table data
 
-__version__ = "1.0.15"
+__version__ = "1.0.16"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
@@ -579,7 +579,7 @@ def classify_book(levels, frac=0.25):
     """Split a price-level list (best-priced first, aggregates excluded) into
     the user's three zones: `top` (best level), `wall` (first level holding
     at least `frac` of the deepest level's stock — the real competition) and
-    `cluster` (better-priced small-fry levels sitting ahead of the wall).
+    `cluster` (better-priced small levels sitting ahead of the wall).
     The </> aggregate row is "the abyss" and is never priced against."""
     real = []
     for e in levels:
@@ -813,9 +813,9 @@ def strategy_rows(levels, n, verb, queue_in_want=False):
 def _wall_note(cls):
     if cls is None or cls["wall"] is cls["top"]:
         return None
-    fry = sum(e["stock"] for e in cls["cluster"])
+    ahead = sum(e["stock"] for e in cls["cluster"])
     return (f"wall: {cls['wall']['stock']:,} @ {_ratio_text(cls['wall'])} — "
-            f"small fry ahead of it: {fry:,}")
+            f"smaller offers ahead of it: {ahead:,}")
 
 
 def build_suggestions(data, n):
