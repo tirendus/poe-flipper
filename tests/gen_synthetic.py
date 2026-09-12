@@ -12,7 +12,14 @@ COMP = [("22.48 : 1", "21"), ("25 : 1", "4"), ("30 : 1", "3"),
         ("40 : 1", "1"), ("46.67 : 1", "3"), ("> 46.67 : 1", "342")]
 
 
-def make(path, width=1920, height=1080, shift=0):
+def make(path, width=1920, height=1080, shift=0,
+         table_dx=0, table_dy=0, hide_market=False, chrome=False):
+    """shift moves the whole panel; table_dx/table_dy additionally move the
+    trade tables relative to the tabs (PoE2's tooltip sits at a different
+    offset than PoE1's); hide_market omits the Market Ratio title (PoE2's
+    tooltip covers it); chrome draws close/pin buttons right of the
+    Available Trades title (a pinned tooltip — OCR merges them into the
+    title, which must not skew the table anchoring)."""
     s = height / 1080.0
 
     def X(x):
@@ -30,8 +37,9 @@ def make(path, width=1920, height=1080, shift=0):
     img = Image.new("RGB", (width, height), (25, 20, 16))
     dr = ImageDraw.Draw(img)
 
-    dr.text((X(960), Y(174)), "Market Ratio", font=font(16, True),
-            fill=WHITE, anchor="mm")
+    if not hide_market:
+        dr.text((X(960), Y(174)), "Market Ratio", font=font(16, True),
+                fill=WHITE, anchor="mm")
     dr.text((X(707), Y(197)), "I Want", font=font(14, True), fill=WHITE,
             anchor="mm")
     dr.text((X(1213), Y(197)), "I Have", font=font(14, True), fill=WHITE,
@@ -43,19 +51,32 @@ def make(path, width=1920, height=1080, shift=0):
     dr.text((X(1217), Y(240)), "Ancient Orb", font=font(15), fill=WHITE,
             anchor="mm")
 
+    def TX(x):
+        return X(x) + int(table_dx * s)
+
+    def TY(y):
+        return Y(y) + int(table_dy * s)
+
     for title, rows, y_top, y_head in (("Available Trades", AVAIL, 215, 220),
                                        ("Competing Trades", COMP, 412, 416)):
-        dr.rectangle((X(862), Y(y_top), X(1062), Y(y_top + 185)), fill=PARCH)
-        dr.text((X(870), Y(y_head)), title, font=font(15, True), fill=DARK)
-        dr.text((X(900), Y(y_head + 24)), "Ratio", font=font(13, True),
-                fill=DARK)
-        dr.text((X(980), Y(y_head + 24)), "Stock", font=font(13, True),
-                fill=DARK)
+        dr.rectangle((TX(862), TY(y_top), TX(1062), TY(y_top + 185)),
+                     fill=PARCH)
+        dr.text((TX(870), TY(y_head)), title, font=font(15, True), fill=DARK)
+        if chrome and title.startswith("Available"):
+            dr.text((TX(1066), TY(y_head)), "X POO", font=font(13, True),
+                    fill=WHITE)
+        # sub-header word centers match the real game's measured positions
+        # (they are calibration anchors)
+        sub_y = 254 if title.startswith("Available") else 452
+        dr.text((TX(896), TY(sub_y)), "Ratio", font=font(13, True),
+                fill=DARK, anchor="mm")
+        dr.text((TX(984), TY(sub_y)), "Stock", font=font(13, True),
+                fill=DARK, anchor="mm")
         y = y_head + 48
         for ratio, stock in rows:
-            dr.text((X(950), Y(y)), ratio, font=font(13), fill=DARK,
+            dr.text((TX(950), TY(y)), ratio, font=font(13), fill=DARK,
                     anchor="ra")
-            dr.text((X(1040), Y(y)), stock, font=font(13), fill=DARK,
+            dr.text((TX(1040), TY(y)), stock, font=font(13), fill=DARK,
                     anchor="ra")
             y += 22
 

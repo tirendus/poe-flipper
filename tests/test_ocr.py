@@ -53,6 +53,52 @@ class TestSynthetic(OcrBase):
         self.assertAlmostEqual(flipper._GEO.dx, 640, delta=8)
 
 
+class TestPoE2Layout(OcrBase):
+    """PoE2 opens the exchange left of center, positions the tooltip at a
+    different offset from the tabs, and covers the Market Ratio title."""
+
+    def _poe2(self, name):
+        # left-shifted panel, independently shifted tables, covered Market
+        # Ratio title, AND pinned-tooltip chrome merging into the Available
+        # Trades title (the real-world case that broke title anchoring)
+        return gen_synthetic.make(str(Path(self.tmp) / name),
+                                  shift=-330, table_dx=-40, table_dy=-40,
+                                  hide_market=True, chrome=True)
+
+    def test_default_left_layout_calibrates(self):
+        path = self._poe2("poe2.png")
+        with tempfile.TemporaryDirectory() as td:
+            old = flipper.CALIB_FILE
+            flipper.CALIB_FILE = Path(td) / "calib.json"
+            try:
+                data = read_screen(Image.open(path).convert("RGB"))
+            finally:
+                flipper.CALIB_FILE = old
+        self.assertEqual(len(data["available"]), 6)
+        self.assertEqual(len(data["competing"]), 6)
+        self.assertEqual(data["available"][0]["price"], 13.0)
+        # tables anchored independently of the tabs
+        self.assertAlmostEqual(flipper._GEO.tdx - flipper._GEO.dx, -40,
+                               delta=10)
+
+    def test_profiles_survive_game_switching(self):
+        poe1 = gen_synthetic.make(str(Path(self.tmp) / "p1.png"))
+        poe2 = self._poe2("p2.png")
+        with tempfile.TemporaryDirectory() as td:
+            old = flipper.CALIB_FILE
+            flipper.CALIB_FILE = Path(td) / "calib.json"
+            try:
+                for path in (poe1, poe2, poe1, poe2):
+                    data = read_screen(Image.open(path).convert("RGB"))
+                    self.assertEqual(len(data["available"]), 6, path)
+                    self.assertEqual(len(data["competing"]), 6, path)
+                profiles, cached = flipper.load_geometries(1920, 1080)
+                self.assertTrue(cached)
+                self.assertEqual(len(profiles), 2)   # one per game layout
+            finally:
+                flipper.CALIB_FILE = old
+
+
 class TestFixtures(OcrBase):
     """Real captures that once broke the parser."""
 

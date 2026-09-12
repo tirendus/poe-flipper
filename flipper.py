@@ -44,6 +44,13 @@ HAVE_FIELD_POS = (1045, 243)
 ANCHOR_MARKET = (960, 174)           # center of the "Market Ratio" title
 ANCHOR_WANT = (707, 197)             # center of the "I Want" tab text
 ANCHOR_HAVE = (1213, 197)            # center of the "I Have" tab text
+ANCHOR_AVAIL_LEFT = (878, 229)       # left edge of the "Available Trades"
+                                     # title (tooltip chrome merges into the
+                                     # right side, so centers are unreliable)
+ANCHOR_SUBHDR = (940, 254)           # midpoint of the first "Ratio | Stock"
+                                     # sub-header row
+ANCHOR_SUBHDR_DY = 198               # vertical gap between the two
+                                     # "Ratio | Stock" rows
 
 OCR_SCALE = 2                        # upscale factor before OCR
 ROW_PITCH = 22 * OCR_SCALE           # vertical distance between table rows (scaled px)
@@ -1223,13 +1230,23 @@ def _verify_fill(geo, have_amount, want_amount):
 
 class Geometry:
     """Maps reference-space (1920x1080) coordinates onto the real screen:
-    screen = ref * s + (dx, dy)."""
+    screen = ref * s + (dx, dy).
 
-    def __init__(self, w, h, s=None, dx=None, dy=None):
+    The trade tables can carry their own transform (ts/tdx/tdy): PoE2's
+    tooltip sits at a different offset from the panel tabs than PoE1's, so
+    the tables crop is anchored on the Available/Competing headers
+    themselves while names and the auto-fill fields keep the tab-derived
+    transform.  When no table anchors are known both transforms match."""
+
+    def __init__(self, w, h, s=None, dx=None, dy=None,
+                 ts=None, tdx=None, tdy=None):
         self.w, self.h = w, h
         self.s = s if s is not None else h / REF_H
         self.dx = dx if dx is not None else w / 2 - (REF_W / 2) * self.s
         self.dy = dy if dy is not None else 0.0
+        self.ts = ts if ts is not None else self.s
+        self.tdx = tdx if tdx is not None else self.dx
+        self.tdy = tdy if tdy is not None else self.dy
 
     def pt(self, p):
         return (int(round(p[0] * self.s + self.dx)),
@@ -1240,31 +1257,68 @@ class Geometry:
         x2, y2 = self.pt(b[2:])
         return (max(0, x1), max(0, y1), min(self.w, x2), min(self.h, y2))
 
+    def tbox(self, b):
+        x1 = int(round(b[0] * self.ts + self.tdx))
+        y1 = int(round(b[1] * self.ts + self.tdy))
+        x2 = int(round(b[2] * self.ts + self.tdx))
+        y2 = int(round(b[3] * self.ts + self.tdy))
+        return (max(0, x1), max(0, y1), min(self.w, x2), min(self.h, y2))
+
+    def to_dict(self):
+        return {"s": self.s, "dx": self.dx, "dy": self.dy,
+                "ts": self.ts, "tdx": self.tdx, "tdy": self.tdy}
+
+    def close_to(self, other, tol=12):
+        return (abs(self.dx - other.dx) <= tol
+                and abs(self.dy - other.dy) <= tol
+                and abs(self.tdx - other.tdx) <= tol
+                and abs(self.tdy - other.tdy) <= tol)
+
 
 _GEO = None     # geometry of the last capture, used by auto_fill
 _APP = None     # running App instance, for worker threads to post UI events
 
+MAX_PROFILES = 3    # remembered panel positions per resolution (PoE1
+                    # centered, PoE2 default-left, a dragged window, ...)
 
-def load_geometry(w, h):
-    """Returns (geometry, from_cache)."""
+
+def load_geometries(w, h):
+    """Cached calibration profiles for this resolution, most recent first.
+    Returns (profiles, from_cache) — an empty cache yields the default
+    center-anchored geometry."""
     try:
         import json
         cfg = json.loads(CALIB_FILE.read_text(encoding="utf-8"))
         if cfg.get("w") == w and cfg.get("h") == h:
-            return Geometry(w, h, cfg["s"], cfg["dx"], cfg["dy"]), True
-    except (OSError, ValueError, KeyError):
+            raw = cfg.get("profiles")
+            if raw is None and "s" in cfg:      # migrate the old format
+                raw = [{"s": cfg["s"], "dx": cfg["dx"], "dy": cfg["dy"]}]
+            profiles = [Geometry(w, h, p["s"], p["dx"], p["dy"],
+                                 p.get("ts"), p.get("tdx"), p.get("tdy"))
+                        for p in raw or []]
+            if profiles:
+                return profiles, True
+    except (OSError, ValueError, KeyError, TypeError):
         pass
-    return Geometry(w, h), False
+    return [Geometry(w, h)], False
 
 
-def save_geometry(geo):
+def save_geometries(w, h, profiles):
     try:
         import json
         CALIB_FILE.write_text(json.dumps(
-            {"w": geo.w, "h": geo.h, "s": geo.s, "dx": geo.dx, "dy": geo.dy}),
+            {"w": w, "h": h,
+             "profiles": [g.to_dict() for g in profiles[:MAX_PROFILES]]}),
             encoding="utf-8")
     except OSError:
         pass
+
+
+def remember_geometry(geo, profiles=None):
+    """Put `geo` at the front of the profile cache, replacing any profile
+    at (nearly) the same position."""
+    profiles = [g for g in (profiles or []) if not geo.close_to(g)]
+    save_geometries(geo.w, geo.h, [geo] + profiles)
 
 
 def screen_size():
@@ -1282,28 +1336,38 @@ def capture_full():
 
 def make_crops(full_img, geo):
     """Cut out the three OCR regions and normalize them to reference size,
-    so the OCR pipeline sees identical input at every resolution."""
+    so the OCR pipeline sees identical input at every resolution.  The
+    tables use the table-anchored transform; the name boxes the tab one."""
     crops = []
-    for ref_box in (TABLES_BOX, WANT_BOX, HAVE_BOX):
+    for ref_box, table in ((TABLES_BOX, True), (WANT_BOX, False),
+                           (HAVE_BOX, False)):
         rw, rh = ref_box[2] - ref_box[0], ref_box[3] - ref_box[1]
-        crops.append(full_img.crop(geo.box(ref_box)).resize((rw, rh),
-                                                            Image.LANCZOS))
+        src = geo.tbox(ref_box) if table else geo.box(ref_box)
+        crops.append(full_img.crop(src).resize((rw, rh), Image.LANCZOS))
     return crops
 
 
 def calibrate(full_img):
-    """Locate the exchange panel headers on the full screenshot and derive
-    the geometry transform.  Returns a Geometry or None."""
+    """Locate the exchange panel on the full screenshot and derive the
+    geometry.  The I Want / I Have tabs anchor names and fill fields; the
+    Available/Competing Trades titles anchor the tables crop exactly (PoE2
+    positions its tooltip differently, and may cover the Market Ratio
+    title entirely — that anchor is only a cross-check).  Returns a
+    Geometry or None."""
     w, h = full_img.size
-    x0, y0 = int(w * 0.15), int(h * 0.05)
-    band = full_img.crop((x0, y0, int(w * 0.85), int(h * 0.32)))
+    x0, y0 = int(w * 0.10), int(h * 0.05)
+    band = full_img.crop((x0, y0, int(w * 0.90), int(h * 0.60)))
     f = max(1.0, 2.0 * REF_H / h)
     cells = ocr_cells(band, scale=f)
 
     def center(c):
         return (x0 + (c[1] + c[3] / 2) / f, y0 + c[2] / f)
 
-    mk = wt = hv = None
+    def left(c):
+        return (x0 + c[1] / f, y0 + c[2] / f)
+
+    mk = wt = hv = av = None
+    ratios, stocks, sub_pairs = [], [], []
     for c in cells:
         t = re.sub(r"[^a-z]", "", c[0].lower())
         if mk is None and "market" in t:
@@ -1312,62 +1376,139 @@ def calibrate(full_img):
             wt = center(c)
         elif hv is None and t in ("ihave", "have"):
             hv = center(c)
-    if not (mk and wt and hv):
-        log(f"calibration: headers not found (market={bool(mk)} "
-            f"want={bool(wt)} have={bool(hv)})")
+        elif av is None and "available" in t:
+            av = left(c)
+        elif t == "ratio":
+            ratios.append(center(c))
+        elif t == "stock":
+            stocks.append(center(c))
+        elif t == "ratiostock":
+            sub_pairs.append(center(c))     # OCR merged the pair — its
+                                            # center IS the row midpoint
+
+    # pair 'Ratio' with the 'Stock' on the same line: chrome-immune anchors
+    # sitting inside the parchment itself
+    used_stocks = set()
+    for r in ratios:
+        best = None
+        for i, st in enumerate(stocks):
+            if i in used_stocks or abs(st[1] - r[1]) > 12 * (h / REF_H):
+                continue
+            gap = st[0] - r[0]
+            if 30 <= gap <= 260 and (best is None or gap < best[1]):
+                best = (i, gap)
+        if best is not None:
+            used_stocks.add(best[0])
+            st = stocks[best[0]]
+            sub_pairs.append(((r[0] + st[0]) / 2, (r[1] + st[1]) / 2))
+    sub_pairs.sort(key=lambda p: p[1])
+
+    s = dx = dy = None
+    if wt and hv:
+        s = (hv[0] - wt[0]) / (ANCHOR_HAVE[0] - ANCHOR_WANT[0])
+        if not 0.3 < s < 5:
+            log(f"calibration: implausible tab scale {s:.3f}")
+            s = None
+        else:
+            dx = (hv[0] + wt[0]) / 2 - (REF_W / 2) * s
+            dy = (wt[1] + hv[1]) / 2 - ANCHOR_WANT[1] * s
+            if mk:
+                exp_mx = ANCHOR_MARKET[0] * s + dx
+                exp_my = ANCHOR_MARKET[1] * s + dy
+                if abs(exp_mx - mk[0]) > 60 * s or \
+                        abs(exp_my - mk[1]) > 60 * s:
+                    log(f"calibration: market anchor off by "
+                        f"({mk[0] - exp_mx:.0f}, {mk[1] - exp_my:.0f}) — "
+                        "using anyway")
+
+    ts = tdx = tdy = None
+    if sub_pairs:
+        if len(sub_pairs) >= 2:
+            ts = (sub_pairs[1][1] - sub_pairs[0][1]) / ANCHOR_SUBHDR_DY
+            if not 0.3 < ts < 5:
+                log(f"calibration: implausible table scale {ts:.3f}")
+                ts = None
+        if ts is None:
+            ts = s if s is not None else h / REF_H
+        tdx = sub_pairs[0][0] - ANCHOR_SUBHDR[0] * ts
+        tdy = sub_pairs[0][1] - ANCHOR_SUBHDR[1] * ts
+    elif av is not None:
+        # fallback: the title's LEFT edge (chrome merges into its right)
+        ts = s if s is not None else h / REF_H
+        tdx = av[0] - ANCHOR_AVAIL_LEFT[0] * ts
+        tdy = av[1] - ANCHOR_AVAIL_LEFT[1] * ts
+
+    if s is None and ts is None:
+        log(f"calibration: anchors not found (market={bool(mk)} "
+            f"want={bool(wt)} have={bool(hv)} avail={bool(av)} "
+            f"subheaders={len(sub_pairs)})")
         return None
-    s = (hv[0] - wt[0]) / (ANCHOR_HAVE[0] - ANCHOR_WANT[0])
-    if not 0.3 < s < 5:
-        log(f"calibration: implausible scale {s:.3f}")
-        return None
-    dx = (hv[0] + wt[0]) / 2 - (REF_W / 2) * s
-    dy = (wt[1] + hv[1]) / 2 - ANCHOR_WANT[1] * s
-    exp_mx, exp_my = ANCHOR_MARKET[0] * s + dx, ANCHOR_MARKET[1] * s + dy
-    if abs(exp_mx - mk[0]) > 60 * s or abs(exp_my - mk[1]) > 60 * s:
-        log(f"calibration: market anchor off by "
-            f"({mk[0] - exp_mx:.0f}, {mk[1] - exp_my:.0f}) — using anyway")
-    return Geometry(w, h, s, dx, dy)
+    if s is None:
+        # tabs unreadable — fall back to the table transform for everything
+        s, dx, dy = ts, tdx, tdy
+        log("calibration: tabs not found — names/fields use table anchors")
+    return Geometry(w, h, s, dx, dy, ts, tdx, tdy)
 
 
 def read_screen(full_img, allow_calibrate=True, persist=True):
-    """Full pipeline: geometry -> crops -> OCR -> parse, with automatic
-    recalibration if the current geometry yields nothing."""
+    """Full pipeline: try each cached panel-position profile (most recent
+    first), then fall back to a fresh calibration.  Keeps profiles for
+    several window positions so switching games (PoE1 centered, PoE2
+    default-left) never needs a recalibration round-trip twice."""
     global _GEO
     w, h = full_img.size
-    geo, cached = load_geometry(w, h)
-    _GEO = geo
-    data = read_panel(*make_crops(full_img, geo))
+    profiles, cached = load_geometries(w, h)
 
     def rows_of(d):
         return len(d["available"]) + len(d["competing"])
 
-    # calibrate when the crop looks misaligned (nothing parsed / many rows
-    # unreadable), or on the first ever capture at this resolution — a parse
-    # can succeed off a slightly shifted crop, but the auto-fill click
-    # positions need exact anchoring
-    suspicious = rows_of(data) == 0 or data["unparsed"] > rows_of(data)
-    if allow_calibrate and (suspicious or not cached):
-        if suspicious:
-            log(f"parse looks off (rows={rows_of(data)}, "
-                f"unparsed={data['unparsed']}) — auto-calibrating")
-        else:
+    def suspicious(d):
+        return rows_of(d) == 0 or d["unparsed"] > rows_of(d)
+
+    best = None, None       # (data, geo) with the most rows so far
+    for i, geo in enumerate(profiles):
+        data = read_panel(*make_crops(full_img, geo))
+        if not suspicious(data):
+            _GEO = geo
+            if i > 0:
+                log(f"profile {i + 1} matched (dx={geo.dx:.0f}) — "
+                    "promoting to front")
+                if persist:
+                    remember_geometry(geo, profiles)
+            if cached or not allow_calibrate:
+                return data
+            # first ever capture at this resolution: the default guess
+            # worked, but calibrate once anyway for exact fill anchoring
             log("first capture at this resolution — calibrating anchors")
+            best = data, geo
+            break
+        if best[0] is None or rows_of(data) > rows_of(best[0]):
+            best = data, geo
+        if i == 0 and len(profiles) > 1:
+            log("last profile missed — trying other cached positions")
+
+    if allow_calibrate:
+        if best[0] is None or suspicious(best[0]):
+            log("no cached profile fits — auto-calibrating")
         geo2 = calibrate(full_img)
         if geo2 is not None:
             data2 = read_panel(*make_crops(full_img, geo2))
-            if rows_of(data2) > 0 and rows_of(data2) >= rows_of(data):
-                log(f"calibration ok: scale={geo2.s:.3f} "
-                    f"dx={geo2.dx:.0f} dy={geo2.dy:.0f}")
+            if rows_of(data2) > 0 and rows_of(data2) >= rows_of(best[0] or
+                                                               data2):
+                log(f"calibration ok: scale={geo2.s:.3f} dx={geo2.dx:.0f} "
+                    f"dy={geo2.dy:.0f} tables dx={geo2.tdx:.0f} "
+                    f"dy={geo2.tdy:.0f}")
                 _GEO = geo2
                 if persist:
-                    save_geometry(geo2)
+                    remember_geometry(geo2, profiles if cached else [])
                 return data2
-            log("calibration did not improve the parse — keeping defaults")
-        if not suspicious and persist:
-            # default geometry works here; remember it so we don't re-run
-            # calibration on every capture
-            save_geometry(geo)
-    return data
+            log("calibration did not improve the parse")
+        if best[1] is not None and not suspicious(best[0]) and persist:
+            remember_geometry(best[1], profiles if cached else [])
+
+    _GEO = best[1] if best[1] is not None else profiles[0]
+    return best[0] if best[0] is not None else read_panel(
+        *make_crops(full_img, profiles[0]))
 
 
 def read_panel(tables_img, want_img, have_img):
@@ -2164,7 +2305,7 @@ def run_buy_test(image_path, budget):
 
 def run_pos():
     from ctypes import wintypes
-    geo, _cached = load_geometry(*screen_size())
+    geo = load_geometries(*screen_size())[0][0]
     print(f"screen {geo.w}x{geo.h}  scale={geo.s:.3f} "
           f"dx={geo.dx:.0f} dy={geo.dy:.0f}")
     print(f"computed fill points: have={geo.pt(HAVE_FIELD_POS)} "
@@ -2209,7 +2350,7 @@ def main():
         return
     if args.dump:
         full = capture_full()
-        geo, _cached = load_geometry(*full.size)
+        geo = load_geometries(*full.size)[0][0]
         tables, want, have = make_crops(full, geo)
         tables.save(APP_DIR / "dump_tables.png")
         want.save(APP_DIR / "dump_want.png")
