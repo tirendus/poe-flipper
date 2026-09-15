@@ -266,6 +266,33 @@ class TestQuantityBuy(unittest.TestCase):
         first = rows[0][1]
         self.assertEqual((first["w"], first["d"]), (5, 13))
 
+    def test_qty_flex_valuable_currency(self):
+        # buying 50 chaos with divines: exact-50 prices step 8.33 -> 10.0,
+        # missing every band; flexing the quantity restores fine pricing,
+        # and the match fallback must not emit a 10:1 row labeled 9.3
+        book = {
+            "market": 9.21, "unparsed": 0,
+            "available": [L(9.22, 1, 461), L(9.21, 1, 2763),
+                          L(9.20, 1, 24886), L(9.19, 1, 708),
+                          L(9.19, 1, 386), L(9.19, 1, 272686, True)],
+            "competing": [L(9.30, 1, 630), L(9.33, 1, 7677), L(9.34, 1, 200),
+                          L(9.35, 1, 200), L(9.38, 1, 353),
+                          L(9.38, 1, 39304, True)],
+            "want_name": "Chaos", "have_name": "Divine",
+        }
+        sugg = build_buy_qty_suggestions(book, 50)
+        rows = sugg["rows"]
+        first = rows[0][1]
+        # Outbid all flexes to 46:5 (9.2/ea) instead of overpaying at 8.33
+        self.assertEqual((first["want_total"], first["used"]), (46, 5))
+        prices = [s["price"] for _l, s in rows]
+        self.assertNotIn(10.0, prices)          # the old bogus "Match 9.3"
+        self.assertFalse(any("Match" in lb and abs(s["price"] - 9.3) > 0.05
+                             for lb, s in rows))
+        # flexed quantities stay within 15% of the request
+        self.assertTrue(all(abs(s["want_total"] - 50) <= 7.5
+                            for _l, s in rows))
+
     def test_qty_no_resale_no_greedy(self):
         rows = build_buy_qty_suggestions(TRADITION, 40)["rows"]
         self.assertFalse(any("Greedy" in lb for lb, _s in rows))

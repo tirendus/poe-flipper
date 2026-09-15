@@ -79,7 +79,7 @@ def main():
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
                                      encoding="utf-8") as f:
         f.write(f"Release {tag}\n\n{args.notes}\n\n"
-                "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>\n")
+                "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\n")
         msg_file = f.name
 
     run(["git", "add", "flipper.py"])

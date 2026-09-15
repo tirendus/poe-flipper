@@ -1010,10 +1010,11 @@ def build_buy_qty_suggestions(data, n):
         resale = None
     out["resale"] = resale
 
-    def qty_row(h):
-        g = math.gcd(n, h)
-        return {"w": n // g, "d": h // g, "price": n / h, "used": h,
-                "left": 0, "want_total": n, "fine": False}
+    def qty_row(h, w=None):
+        w = n if w is None else w
+        g = math.gcd(w, h)
+        return {"w": w // g, "d": h // g, "price": w / h, "used": h,
+                "left": 0, "want_total": w, "fine": False}
 
     def find_h(t, lo, hi):
         """Integer currency total whose price n/h sits strictly inside the
@@ -1030,15 +1031,40 @@ def build_buy_qty_suggestions(data, n):
                 best_h = h
         return best_h
 
+    def find_flex(t, lo, hi, flex=0.15):
+        """Near-quantity pair (w, h): when the want currency is much
+        cheaper than the have currency, exact-n prices step too coarsely
+        (50 chaos for whole divines allows only 10.0 or 8.33 per) —
+        flexing the want side a little restores fine pricing."""
+        best = None
+        h_mid = n / t
+        for h in range(max(1, int(h_mid * 0.7)), int(h_mid * 1.4) + 2):
+            for w in {math.floor(t * h), round(t * h), math.ceil(t * h)}:
+                if w < 1 or not n * (1 - flex) <= w <= n * (1 + flex):
+                    continue
+                p = w / h
+                if lo is not None and p <= lo:
+                    continue
+                if hi is not None and p >= hi:
+                    continue
+                score = abs(p - t) / t + 0.02 * abs(w - n) / n
+                if best is None or score < best[0]:
+                    best = (score, w, h)
+        return (best[1], best[2]) if best else None
+
     seen_h = set()
     fine_rows = []
 
-    def add(label, h, fine=False):
-        if h is not None and h >= 1 and h not in seen_h:
-            seen_h.add(h)
-            r = qty_row(h)
-            r["fine"] = fine
-            (fine_rows if fine else out["rows"]).append((label, r))
+    def add(label, h, w=None, fine=False):
+        if h is None or h < 1:
+            return
+        key = (w if w is not None else n, h)
+        if key in seen_h:
+            return
+        seen_h.add(key)
+        r = qty_row(h, w)
+        r["fine"] = fine
+        (fine_rows if fine else out["rows"]).append((label, r))
 
     # fill-block sizes to try, smallest first: an order fills in chunks of
     # its reduced ratio's want side, so small blocks matter for scarce
@@ -1068,14 +1094,29 @@ def build_buy_qty_suggestions(data, n):
 
     def add_rung(label, t, lo, hi):
         hb = block_price(lo, hi)
+        he = find_h(t, lo, hi)
         if hb is not None:
             add(label, hb)
-        h = find_h(t, lo, hi)
-        # the exact-total variant is finer-priced but fills in one giant
-        # block — secondary when a small-block price exists
-        if h is not None and h != hb:
-            add(label, h, fine=hb is not None)
-        return hb is not None or h is not None
+            # the exact-total variant is finer-priced but fills in one
+            # giant block — secondary when a small-block price exists
+            if he is not None and he != hb:
+                add(label, he, fine=True)
+            return True
+        # no small-block price: pick the candidate closest to the target
+        # among exact-quantity and flexed-quantity pairs
+        cands = []
+        if he is not None:
+            cands.append((abs(n / he - t) / t, he, None))
+        fx = find_flex(t, lo, hi)
+        if fx is not None:
+            cands.append((abs(fx[0] / fx[1] - t) / t, fx[1], fx[0]))
+        if not cands:
+            return False
+        cands.sort()
+        add(label, cands[0][1], w=cands[0][2])
+        for _e, h2, w2 in cands[1:]:
+            add(label, h2, w=w2, fine=True)
+        return True
 
     cls = classify_book(comp) if comp else None
     if cls is not None:
@@ -1096,11 +1137,15 @@ def build_buy_qty_suggestions(data, n):
             if not add_rung(f"{ordinal[k]} in line ({round(cum):,} ahead)",
                             real[k]["price"] * 0.995,
                             real[k - 1]["price"], real[k]["price"]):
-                # no price fits between adjacent levels (tiny n on a
-                # densely packed book) — join the upper level's queue
-                add(f"Match {_ratio_text(real[k - 1])} "
-                    f"({round(cum):,} ahead)",
-                    round(n / real[k - 1]["price"]))
+                # no price fits between adjacent levels — join the upper
+                # level's queue, but only when whole-currency rounding
+                # really lands ON that level's price (otherwise the row
+                # would claim a match it doesn't make)
+                lvl_p = real[k - 1]["price"]
+                h_m = round(n / lvl_p)
+                if h_m >= 1 and abs(n / h_m - lvl_p) <= 0.005 * lvl_p:
+                    add(f"Match {_ratio_text(real[k - 1])} "
+                        f"({round(cum):,} ahead)", h_m)
         if cls["abyss"] is not None:
             last_p = real[-1]["price"]
             cum_all = cum + items(real[-1]) if len(real) > 1 \
