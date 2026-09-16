@@ -293,6 +293,23 @@ class TestQuantityBuy(unittest.TestCase):
         self.assertTrue(all(abs(s["want_total"] - 50) <= 7.5
                             for _l, s in rows))
 
+    def test_qty_flex_tie_does_not_crash(self):
+        # v1.0.19 regression: exact and flexed candidates with equal error
+        # made the tuple sort compare None with int -> TypeError, leaving
+        # the popup silently inert on Enter
+        book = {
+            "market": 0.1, "unparsed": 0,
+            "available": [L(1, 14.5, 10), L(1, 14.66, 3), L(1, 14.75, 678),
+                          L(1, 15, 188), L(1, 15.5, 2), L(1, 15.5, 936, True)],
+            "competing": [L(1, 10, 270), L(1, 8, 7992), L(1, 7, 119),
+                          L(1, 6.2, 31), L(1, 6.11, 110), L(1, 6.11, 9258, True)],
+            "want_name": "Item", "have_name": "Chaos",
+        }
+        rows = build_buy_qty_suggestions(book, 8)["rows"]
+        self.assertTrue(rows)
+        self.assertTrue(all(s["used"] >= 1 and s["want_total"] >= 1
+                            for _l, s in rows))
+
     def test_qty_no_resale_no_greedy(self):
         rows = build_buy_qty_suggestions(TRADITION, 40)["rows"]
         self.assertFalse(any("Greedy" in lb for lb, _s in rows))

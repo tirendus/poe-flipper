@@ -1112,7 +1112,7 @@ def build_buy_qty_suggestions(data, n):
             cands.append((abs(fx[0] / fx[1] - t) / t, fx[1], fx[0]))
         if not cands:
             return False
-        cands.sort()
+        cands.sort(key=lambda c: c[0])      # (err, h, w) - w may be None
         add(label, cands[0][1], w=cands[0][2])
         for _e, h2, w2 in cands[1:]:
             add(label, h2, w=w2, fine=True)
@@ -1823,9 +1823,16 @@ class Popup:
             self.win.after(150, lambda: self._on_submit(None))
             return
         data = self.ref["data"]
-        sell_sugg = build_suggestions(data, n) if n else None
-        buy_sugg = build_buy_suggestions(data, m) if m else None
-        qty_sugg = build_buy_qty_suggestions(data, q) if q else None
+        try:
+            sell_sugg = build_suggestions(data, n) if n else None
+            buy_sugg = build_buy_suggestions(data, m) if m else None
+            qty_sugg = build_buy_qty_suggestions(data, q) if q else None
+        except Exception:
+            # a builder crash must never leave the popup silently inert
+            log("suggestion builder failed:" + chr(10) + traceback.format_exc())
+            self.status.configure(
+                text="⚠ pricing failed — see flipper.log", fg="#d06050")
+            return
         for child in self.frame.winfo_children():
             child.destroy()
         del self.status
