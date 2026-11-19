@@ -64,7 +64,7 @@ RATIO_HDR_X = 93                     # where the "Ratio" sub-header starts when
 BAND_LEFT_SLACK = 15                 # wide rows ("> 10.56 : 1") reach further
                                      # left than the fixed band allowed
 
-__version__ = "1.0.23"
+__version__ = "1.0.24"
 GITHUB_REPO = "tirendus/poe-flipper"
 
 HOTKEY_DEFAULT = "alt+q"
