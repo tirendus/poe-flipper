@@ -16,6 +16,7 @@ import time
 import traceback
 import tkinter as tk
 import tkinter.font as tkfont
+from ctypes import wintypes
 from pathlib import Path
 from tkinter import ttk
 
@@ -58,6 +59,19 @@ def fmt_age(seconds):
     return f"{round(seconds / 86400)} d ago"
 
 
+def window_dpi(widget):
+    """DPI of the monitor `widget`'s window is on (96 = 100% scale)."""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(widget.winfo_id()) or widget.winfo_id()
+        dpi = user32.GetDpiForWindow(wintypes.HWND(hwnd))
+        if dpi:
+            return int(dpi)
+    except (OSError, AttributeError, tk.TclError):
+        pass                                    # before Windows 10 1607
+    return int(round(widget.winfo_fpixels("1i")))
+
+
 def log_error(text):
     try:
         with open(sd.DATA_DIR / "stash_window.log", "a", encoding="utf-8") as f:
@@ -89,11 +103,19 @@ class StashWindow:
         self.tab_vars = {}
         self.session = None             # running selling session, if any
 
-        self.font = tkfont.Font(family="Segoe UI", size=10)
-        self.bold = tkfont.Font(family="Segoe UI", size=10, weight="bold")
-        self.small = tkfont.Font(family="Segoe UI", size=9)
-        self.big = tkfont.Font(family="Segoe UI", size=12, weight="bold")
-        self._build()
+        # Fonts are sized in pixels for the monitor the window is on.  A
+        # point size would follow Tk's one scaling for the whole process
+        # (the primary monitor's), and that must stay as it is: the popup
+        # and the selling bar are drawn with it on the game's screen.
+        self.dpi = window_dpi(root)
+        self.fonts = [(tkfont.Font(family="Segoe UI", weight=weight), points)
+                      for points, weight in ((10, "normal"), (10, "bold"),
+                                             (9, "normal"), (12, "bold"))]
+        self.font, self.bold, self.small, self.big = (
+            font for font, _points in self.fonts)
+        self._size_fonts()
+        self._build_window()
+        self._build_layout()
         # an error inside a button handler must be seen, not swallowed:
         # under pythonw there is no console for the traceback to land in
         self.root.report_callback_exception = self._callback_error
@@ -113,7 +135,11 @@ class StashWindow:
 
     # ---------------------------------------------------------- layout ---
 
-    def _build(self):
+    def _size_fonts(self):
+        for font, points in self.fonts:
+            font.configure(size=-max(1, round(points * self.dpi / 72)))
+
+    def _build_window(self):
         root = self.root
         root.title("PoE Flipper - stash")
         root.configure(bg=BG)
@@ -121,6 +147,34 @@ class StashWindow:
             root.iconbitmap(str(sd.APP_DIR / "flipper.ico"))
         except tk.TclError:
             pass
+        root.bind("<Configure>", self._on_resize)
+
+    def _rescale(self, dpi):
+        """The window now sits on a monitor with another scale.  Tk does not
+        follow that by itself — the window would keep its size in pixels and
+        fill most of a smaller screen — so the fonts are resized for the new
+        monitor and everything is laid out again around them."""
+        ratio = dpi / self.dpi
+        self.dpi = dpi
+        self._size_fonts()
+        width, height = self.root.winfo_width(), self.root.winfo_height()
+        self.shell.destroy()
+        self._build_layout(first=False)
+        self._build_tabs()
+        self._rebuild()
+        self._set_busy(self.busy)
+        if self.session is not None:
+            self.btn_sell.configure(text="Stop selling")
+        self.root.geometry(f"{max(1, round(width * ratio))}x"
+                           f"{max(1, round(height * ratio))}")
+
+    def _build_layout(self, first=True):
+        """Everything inside the window.  Every size in here derives from
+        the fonts, so building it again after _size_fonts is all a change
+        of monitor scale needs."""
+        # the content lives in one frame that _rescale can throw away
+        root = self.shell = tk.Frame(self.root, bg=BG)
+        root.pack(fill="both", expand=True)
         unit = self.font.measure("0")
         pad = self.pad = unit
 
@@ -149,7 +203,6 @@ class StashWindow:
         self.summary2 = tk.Label(root, text="", bg=BG, fg=DIM,
                                  font=self.small, anchor="w", justify="left")
         self.summary2.pack(fill="x", padx=pad, pady=(0, 3))
-        root.bind("<Configure>", self._on_resize)
 
         sellbar = tk.Frame(root, bg=BG)
         sellbar.pack(side="bottom", fill="x", padx=pad, pady=(0, pad // 2))
@@ -232,10 +285,13 @@ class StashWindow:
         self.tree.bind("<Double-Button-1>", self._on_double)
         self.tree.bind("<space>", self._on_space)
 
-        width = unit * (sum(c[2] for c in self.COLS) + 6)
-        height = int(self.font.metrics("linespace") * 34)
-        root.geometry(f"{width}x{height}")
-        root.minsize(unit * 70, int(self.font.metrics("linespace") * 16))
+        if first:
+            width = unit * (sum(c[2] for c in self.COLS) + 6)
+            height = int(self.font.metrics("linespace") * 34)
+            self.root.geometry(f"{width}x{height}")
+        self.root.minsize(unit * 70,
+                          int(self.font.metrics("linespace") * 16))
+        self._on_resize(None)
 
     def _button(self, parent, text, command, primary=False):
         return tk.Button(
@@ -272,10 +328,17 @@ class StashWindow:
         return label
 
     def _on_resize(self, event):
-        if event.widget is self.root:
-            wrap = max(300, event.width - 2 * self.pad)
+        """Keep the wrapping text as wide as the window (`event` is None
+        when the layout has just been rebuilt)."""
+        if event is not None and event.widget is not self.root:
+            return
+        width = event.width if event is not None else self.root.winfo_width()
+        wrap = max(300, width - 2 * self.pad)
+        try:
             for label in (self.status, self.summary, self.summary2):
                 label.configure(wraplength=wrap)
+        except (AttributeError, tk.TclError):   # mid-rebuild
+            pass
 
     def _build_tabs(self):
         for child in self.tabs_frame.winfo_children():
@@ -611,7 +674,20 @@ class StashWindow:
             self.q.put(("error", "Price refresh failed - details in "
                                  "stash_window.log"))
 
+    def _follow_monitor(self):
+        """Rescale once the window has been dropped on a monitor with
+        another scale (not mid-drag: resizing under the cursor fights the
+        move)."""
+        try:
+            dpi = window_dpi(self.root)
+            dragging = ctypes.windll.user32.GetAsyncKeyState(0x01) & 0x8000
+            if dpi != self.dpi and not dragging:
+                self._rescale(dpi)
+        except (tk.TclError, OSError, AttributeError):
+            pass
+
     def _poll(self):
+        self._follow_monitor()
         try:
             while True:
                 kind, payload = self.q.get_nowait()
@@ -655,6 +731,34 @@ def relaunch_in_venv():
     return True
 
 
+def set_dpi_awareness():
+    """Per-monitor DPI awareness, the same as flipper.py: screenshots,
+    clicks and windows are all in physical pixels, and the popup and the
+    selling bar — always on the game's monitor — come out right wherever
+    the stash window happens to be.  Tk does not follow a window to a
+    monitor with another scale, so StashWindow rescales itself (_rescale).
+
+    System awareness looked simpler, since Windows then scales the window,
+    but it also scales every window created while this one sits on the
+    other monitor: the popup came out half size on the game's screen.
+
+    The "v2" flavour is asked for first — with it Windows scales the title
+    bar too when the window changes monitor — then plain per-monitor."""
+    try:    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, Windows 10 1703+
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(-4)):
+            return
+    except (OSError, AttributeError):
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (OSError, AttributeError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (OSError, AttributeError):
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", metavar="DIR",
@@ -664,20 +768,7 @@ def main():
         return
     if args.data_dir:
         sd.DATA_DIR = Path(args.data_dir)
-    # System DPI awareness (1), not flipper.py's per-monitor (2).  On the
-    # primary monitor — where the game is — both give physical pixels for
-    # screenshots, clicks and Tk alike.  The difference is a second monitor
-    # with another scale: Tk does not follow per-monitor DPI changes, so a
-    # window dragged from a 200% 4K screen to a 100% Full HD one kept its
-    # pixel size and filled 81% of that screen; in this mode Windows
-    # rescales it and it stays the same apparent size (41%, measured).
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except (OSError, AttributeError):
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except (OSError, AttributeError):
-            pass
+    set_dpi_awareness()
     root = tk.Tk()
     StashWindow(root)
     root.mainloop()
