@@ -522,6 +522,29 @@ class TestFlow(SellerBase):
         self.assertEqual(game.of("click"), [])
         self.assertEqual(game.of("paste"), [])
 
+    def test_waits_for_a_slow_tooltip_without_recalibrating(self):
+        # live on a 1080p screen the tooltip was not up yet on the first
+        # frame; flipper got that frame, found no tables and spent ~3 s
+        # recalibrating before the retry.  Early frames are now skipped.
+        game = FakeGame(["panel_chaos_stacked_deck", "panel_chaos_stacked_deck",
+                         "panel_chaos_stacked_deck", "tooltip_stacked_deck"])
+        seen, orig = [], flipper.read_screen
+
+        def spy(img, *a, **k):
+            seen.append(img)
+            return orig(img, *a, **k)
+        flipper.read_screen = spy
+        try:
+            got = seller.prepare_item(game, "Stacked Deck")
+        finally:
+            flipper.read_screen = orig
+        self.assertEqual(game.frames, [])
+        self.assertEqual(len(seen), 1)          # only the frame with tables
+        self.assertTrue(got["data"]["competing"])
+        # one Alt hold covered all the waiting
+        self.assertEqual(len(game.of("down")), 1)
+        self.assertEqual(len(game.of("up")), 1)
+
     def test_wrong_item_in_the_slot_stops_before_pricing(self):
         # the picker step "succeeded" but the slot shows another item
         game = FakeGame(["panel_chaos_stacked_deck", "tooltip_stacked_deck"])

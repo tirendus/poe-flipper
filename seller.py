@@ -629,6 +629,18 @@ def check_slot(img, geo, side, name):
         raise SellError(f"The slot shows [{shown or 'nothing'}] instead of [{name}].")
 
 
+TOOLTIP_POLLS = 6   # frames looked at per Alt hold; each costs one small
+                    # OCR pass (~0.2-0.3 s), so ~2 s at the very most
+
+
+def tooltip_up(img, geo):
+    """Is the Market Ratio tooltip on this frame?  Its section titles
+    ("Available Trades", "Competing Trades") and "Stock" column appear
+    nowhere else in the tables box."""
+    text = norm(" ".join(c[0] for c in ocr_box(img, geo.tbox(flipper.TABLES_BOX))))
+    return norm("Trades") in text or norm("Stock") in text
+
+
 def read_market(game, geo, have=None):
     """Hover the market ratio with Alt held and read the tables through
     flipper's own pipeline.  Returns flipper's data dict, plus
@@ -638,12 +650,21 @@ def read_market(game, geo, have=None):
     is checked on the same screenshot first (the tooltip leaves both slots
     visible)."""
     img = None
-    for wait in (0.4, 0.8):
+    for _attempt in range(2):
         game.move(*geo.pt(MARKET_POS))
         game.key_down(VK_MENU)
         try:
-            game.sleep(wait)
-            img = game.capture()
+            # the tooltip takes anything from 0.2 s to over half a second to
+            # come up.  A frame taken too early has no tables, and flipper
+            # answers that with a recalibration (~3 s) — so look for the
+            # tooltip with one cheap OCR pass and only hand flipper a frame
+            # that has it (or the last one, when it never showed)
+            game.sleep(0.15)
+            for poll in range(TOOLTIP_POLLS):
+                img = game.capture()
+                if poll == TOOLTIP_POLLS - 1 or tooltip_up(img, geo):
+                    break
+                game.sleep(0.08)
         finally:
             game.key_up(VK_MENU)
         if have is not None:
